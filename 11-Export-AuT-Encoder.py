@@ -6,7 +6,7 @@ from pathlib import Path
 
 # 将自定义模型目录添加到 sys.path
 PROJECT_ROOT = Path(__file__).parent.absolute()
-CUSTOM_MODEL_DIR = PROJECT_ROOT / "model" / "qwen_asr_custom"
+CUSTOM_MODEL_DIR = PROJECT_ROOT / "qwen_asr_gguf" / "qwen3_asr_custom"
 if str(CUSTOM_MODEL_DIR) not in sys.path:
     sys.path.insert(0, str(CUSTOM_MODEL_DIR))
 
