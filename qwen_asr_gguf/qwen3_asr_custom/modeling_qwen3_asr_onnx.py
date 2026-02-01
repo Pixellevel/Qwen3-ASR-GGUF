@@ -13,116 +13,33 @@ from modeling_qwen3_asr import (
     Qwen3ASRAudioEncoderLayer
 )
 
-class StatefulAudioEncoderWrapper(nn.Module):
+class EncoderConvFrontend(nn.Module):
     """
-    Qwen3-ASR Audio Encoder 的 ONNX 导出包装类。
-    支持流式推理中的卷积状态（Conv State）管理。
+    Qwen3-ASR 音频编码器前端：分块卷积部分。
+    将 Mel 频谱转换为中间隐藏状态。
+    严格对齐官方的 100 帧物理分块逻辑，确保 Token 数量精确一致。
     """
     def __init__(self, encoder: Qwen3ASRAudioEncoder):
         super().__init__()
         self.encoder = encoder
-        self.config = encoder.config
-        
-    def forward(
-        self, 
-        input_features: torch.Tensor,  # [batch, seq_len, 128]
-        conv_state: torch.Tensor,      # [batch, overlap_len, 128]
-        seq_offset: torch.Tensor,      # [1] or scalar
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # 1. 拼接状态
-        full_features = torch.cat([conv_state, input_features], dim=1) 
-        next_conv_state = full_features[:, -8:, :] # 取末尾作为状态
-        
-        # 2. 卷积下采样
-        x = full_features.transpose(1, 2).unsqueeze(1)
-        x = F.gelu(self.encoder.conv2d1(x))
-        x = F.gelu(self.encoder.conv2d2(x))
-        x = F.gelu(self.encoder.conv2d3(x))
-        
-        # 3. 展平并映射
-        b, c, f, t = x.size()
-        x = x.permute(0, 3, 1, 2).contiguous().view(b, t, c * f)
-        hidden_states = self.encoder.conv_out(x)
-        
-        # 4. 位置编码 (关键修正：使用 seq_offset)
-        # 此时 t 是包含 overlap token 的总长度。
-        # Index 0 是 overlap token (对应 seq_offset - 1)
-        # Index 1 是第一个 valid token (对应 seq_offset)
-        # 我们构建 indices = [seq_offset-1, seq_offset, ..., seq_offset + t - 2]
-        
-        # 注意：seq_offset 是 Tensor，需要确保计算在正确的设备上
-        start_pos = seq_offset - 1
-        pos_indices = torch.arange(t, device=hidden_states.device) + start_pos
-        # Clamp negative indices to 0 (针对 seq_offset=0 的情况，此时 overlap token 是 pad)
-        pos_indices = torch.clamp(pos_indices, min=0)
-        
-        # 从 buffer 中 gather
-        # positional_embedding shape: [max_len, dim]
-        # F.embedding 需要 indices 是 LongTensor
-        pos_emb = F.embedding(
-            pos_indices, 
-            self.encoder.positional_embedding.positional_embedding
-        )
-        
-        hidden_states = hidden_states + pos_emb.unsqueeze(0).to(hidden_states.dtype)
-        
-        # 5. Transformer 处理 (关键：需要打平 Batch 维度以匹配官方 Attention 实现)
-        # 官方实现中，hidden_states 是 [Total_Tokens, Hidden_Dim]
-        batch_size = hidden_states.size(0)
-        seq_len = hidden_states.size(1)
-        hidden_dim = hidden_states.size(2)
-        
-        hidden_states_flattened = hidden_states.view(-1, hidden_dim)
-        
-        # 生成 cu_seqlens
-        # 因为我们是固定窗口，cu_seqlens 描述每个 Batch 的起始位置
-        cu_seqlens = torch.arange(0, (batch_size + 1) * seq_len, seq_len, dtype=torch.int32, device=hidden_states.device)
-        
-        for layer in self.encoder.layers:
-            # layer 返回 (hidden_states,)
-            hidden_states_flattened = layer(hidden_states_flattened, cu_seqlens)[0]
-            
-        # 恢复维度 [B, T, H]
-        hidden_states = hidden_states_flattened.view(batch_size, seq_len, hidden_dim)
-            
-        hidden_states = self.encoder.ln_post(hidden_states)
-        hidden_states = self.encoder.proj1(hidden_states)
-        hidden_states = F.gelu(hidden_states)
-        hidden_states = self.encoder.proj2(hidden_states)
-        
-        # 6. Slicing (关键修正：去除首个 overlap token)
-        hidden_states = hidden_states[:, 1:, :]
-        
-        return hidden_states, next_conv_state
+        # 根据官方配置，n_window=50, 所以分块大小为 2 * n_window = 100
+        self.chunk_size = 100 
 
-class DiscreteAudioEncoder(nn.Module):
-    """
-    非流式的导出包装，用于验证。
-    必须与官方 modeling_qwen3_asr.py 中的分块逻辑对齐，否则 Token 数量和边界特征会不一致。
-    """
-    def __init__(self, encoder: Qwen3ASRAudioEncoder):
-        super().__init__()
-        self.encoder = encoder
-        self.n_window = encoder.config.n_window # 通常是 100 (对应 50 个 token)
+    def forward(self, mel: torch.Tensor):
+        # mel: [B, T, D]
+        b, t, d = mel.size()
+        chunk_size = self.chunk_size
         
-    def forward(self, input_features: torch.Tensor):
-        # input_features: [B, T, D]
-        b, t, d = input_features.size()
-        chunk_size = self.n_window * 2 # 100
-        
-        # 1. 分块 (对齐官方 forward L693)
-        # 注意：ONNX 导出时，若 t 是动态的，split 可能会有问题。
-        # 我们采用更稳妥的方式：Padding 到 chunk_size 的倍数，然后 Reshape
+        # 1. 物理分块与填充 (对齐官方行为)
         pad_len = (chunk_size - (t % chunk_size)) % chunk_size
         if pad_len > 0:
-            input_features = F.pad(input_features, (0, 0, 0, pad_len))
+            mel = F.pad(mel, (0, 0, 0, pad_len))
         
         t_padded = t + pad_len
         num_chunks = t_padded // chunk_size
         
         # [B, T_p, D] -> [B * N, chunk_size, D]
-        # 模拟官方的 padded_feature [num_chunks, D, chunk_size]
-        chunks = input_features.view(b * num_chunks, chunk_size, d)
+        chunks = mel.view(b * num_chunks, chunk_size, d)
         x = chunks.transpose(1, 2).unsqueeze(1) # [B*N, 1, D, chunk_size]
         
         # 2. 卷积下采样
@@ -131,54 +48,108 @@ class DiscreteAudioEncoder(nn.Module):
         x = F.gelu(self.encoder.conv2d3(x))
         
         # 3. 展平与映射
-        bn, c, f, tn = x.size() # tn 通常是 13 (针对 chunk_size=100)
+        bn, c, f, tn = x.size() # tn = 13
         x = x.permute(0, 3, 1, 2).contiguous().view(bn, tn, c * f)
-        chunk_hidden = self.encoder.conv_out(x) # [B*N, tn, H]
+        hidden_states = self.encoder.conv_out(x) # [B*N, 13, H]
         
-        # 4. 位置编码 (Chunk-wise)
-        # 关键对齐：官方模型中，每个 100 帧块的卷积输出都加上从 0 开始的位置编码
-        pos_emb = self.encoder.positional_embedding.positional_embedding[:tn, :]
-        chunk_hidden = chunk_hidden + pos_emb.unsqueeze(0).to(chunk_hidden.dtype)
+        # 4. 合并并还原形状到 [B, N*13, H]
+        hidden_states = hidden_states.view(b, num_chunks * tn, -1)
         
-        # 5. 合并并还原形状
-        hidden_states = chunk_hidden.view(b, num_chunks * tn, -1)
-        
-        # 6. 处理 Mask / 裁剪 (根据原始长度 t 计算真实的 token 数)
-        # 模拟 _get_feat_extract_output_lengths
-        input_lengths_leave = t % 100
+        # 5. 长度对齐 (移除末尾因为 Padding 产生的多余 Token)
+        input_lengths_leave = t % chunk_size
         feat_lengths = (input_lengths_leave - 1) // 2 + 1 if input_lengths_leave > 0 else 0
         rem_tokens = ((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1 if feat_lengths > 0 else 0
-        total_tokens = (t // 100) * 13 + rem_tokens
+        total_tokens = (t // chunk_size) * tn + rem_tokens
         
-        # 切片，去除因为 Padding 产生的多余 token
         hidden_states = hidden_states[:, :total_tokens, :]
+        return hidden_states
+
+class EncoderTransformerBackend(nn.Module):
+    """
+    Qwen3-ASR 音频编码器后端：Transformer 部分。
+    实现局部位置编码 (0-12) 和 104-token 窗口化注意力。
+    """
+    def __init__(self, encoder: Qwen3ASRAudioEncoder):
+        super().__init__()
+        self.encoder = encoder
         
-        # 7. Transformer 处理 (注意：官方使用 n_window_infer 进行 Attention 分块)
-        # 默认 n_window_infer=400, 对应 52 个 token (4 * 13)
-        window_tokens = 52 # 13 * (400 // 100)
+    def forward(self, hidden_states: torch.Tensor):
+        # hidden_states: [B, T, H]
+        b, t, h = hidden_states.size()
+        device = hidden_states.device
         
-        bh, th, dh = hidden_states.size()
-        hidden_states_flattened = hidden_states.view(-1, dh)
+        # 1. 添加局部位置编码 (对齐官方逻辑：每个分块内部重置位置索引)
+        # 官方代码中是在 [Num_Chunks, 13, H] 形状下加法的
+        tn = 13
+        # 构造一个足够长的 position_embedding 映射
+        # 我们按照 tn=13 进行周期性填充，或者简单reshape
+        # 考虑到动态 T 可能不是 13 的倍数（虽然我们在 FE 做了处理），更稳妥的做法是：
+        pos_indices = torch.arange(t, device=device) % tn
+        pos_emb = F.embedding(
+            pos_indices, 
+            self.encoder.positional_embedding.positional_embedding
+        )
+        hidden_states = hidden_states + pos_emb.unsqueeze(0).to(hidden_states.dtype)
         
-        # 生成对齐官方的 cu_seqlens
-        cu_chunk_lens = []
-        for i in range(th // window_tokens):
-            cu_chunk_lens.append(window_tokens)
-        if th % window_tokens != 0:
-            cu_chunk_lens.append(th % window_tokens)
+        # 2. Transformer 处理 (窗口化 Attention)
+        # n_window_infer = 800 frames = 8 chunks * 13 tokens = 104 tokens
+        window_size = 104 
+        
+        hidden_states_flattened = hidden_states.view(-1, h)
+        
+        # 生成符号化 cu_seqlens 以支持 ONNX 导出
+        num_windows = (t + window_size - 1) // window_size
+        steps = torch.arange(0, num_windows, device=device) * window_size
+        cu_seqlens_single = torch.cat([steps, torch.tensor([t], device=device, dtype=steps.dtype)])
+        
+        if b > 1:
+            offsets = (torch.arange(0, b, device=device) * t).view(-1, 1)
+            cu_seqlens = (cu_seqlens_single.view(1, -1) + offsets).view(-1).to(torch.int32)
+        else:
+            cu_seqlens = cu_seqlens_single.to(torch.int32)
             
-        cu_seqlens = torch.tensor([0] + cu_chunk_lens, dtype=torch.int32, device=hidden_states.device).cumsum(0, dtype=torch.int32)
-        
         for layer in self.encoder.layers:
-            # 注意：官方层需要 flattened 输入和 cu_seqlens
             hidden_states_flattened = layer(hidden_states_flattened, cu_seqlens)[0]
             
-        hidden_states = hidden_states_flattened.view(bh, th, dh)
+        hidden_states = hidden_states_flattened.view(b, t, h)
         
-        # 8. 后处理
+        # 3. 后投影
         hidden_states = self.encoder.ln_post(hidden_states)
         hidden_states = self.encoder.proj1(hidden_states)
         hidden_states = F.gelu(hidden_states)
         hidden_states = self.encoder.proj2(hidden_states)
         
         return hidden_states
+
+class StatefulAudioEncoderWrapper(nn.Module):
+    """
+    为了向后兼容 transcribe.py 的 API，保留这个类。
+    由于 Qwen3-ASR 卷积是固定分块且独立处理，流式状态仅用于缓存不满足 100 帧的残余物理帧。
+    但在目前非流式转录中，它直接调用 Frontend + Backend。
+    """
+    def __init__(self, encoder: Qwen3ASRAudioEncoder):
+        super().__init__()
+        self.frontend = EncoderConvFrontend(encoder)
+        self.backend = EncoderTransformerBackend(encoder)
+        
+    def forward(self, mel: torch.Tensor, conv_state: torch.Tensor = None, seq_offset: torch.Tensor = None):
+        # 注意：这里的 conv_state 和 seq_offset 目前在 ASR 逻辑中不再是卷积必需
+        # 我们暂时忽略它们以确保数学对齐，未来若做低延迟流式需重新设计缓存 buffer
+        hidden_states_fe = self.frontend(mel)
+        output = self.backend(hidden_states_fe)
+        # 返回格式尽量兼容：(output, next_conv_state)
+        # 由于这里不再使用 conv_state，我们返回一个假的 next_conv_state
+        return output, torch.zeros((1, 8, 128), device=mel.device)
+
+class DiscreteAudioEncoder(nn.Module):
+    """
+    全量合体版本。已在 01-合体encoder.py 中验证。
+    """
+    def __init__(self, encoder: Qwen3ASRAudioEncoder):
+        super().__init__()
+        self.fe = EncoderConvFrontend(encoder)
+        self.be = EncoderTransformerBackend(encoder)
+        
+    def forward(self, mel: torch.Tensor):
+        x = self.fe(mel)
+        return self.be(x)

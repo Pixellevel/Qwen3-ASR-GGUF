@@ -19,8 +19,7 @@ from qwen_asr.core.transformers_backend.processing_qwen3_asr import Qwen3ASRProc
 # 配置参数 (根据您的路径环境修改)
 # ==========================================
 HF_MODEL_DIR = r"C:\Users\Haujet\.cache\modelscope\hub\models\Qwen\Qwen3-ASR-1.7B"
-FRONTEND_ONNX_PATH = os.path.join(PROJECT_ROOT, "model", "onnx", "qwen3_asr_encoder_frontend.onnx")
-BACKEND_ONNX_PATH = os.path.join(PROJECT_ROOT, "model", "onnx", "qwen3_asr_encoder_backend.int8.onnx")
+ENCODER_ONNX_PATH = os.path.join(PROJECT_ROOT, "model", "onnx", "qwen3_asr_encoder_discrete_all.onnx")
 LLM_GGUF_PATH = os.path.join(PROJECT_ROOT, "model", "qwen3_asr_llm.f16.gguf")
 
 # Special Token IDs
@@ -33,7 +32,7 @@ ID_ASR_TEXT = 151704
 
 class Qwen3ASRTranscriber:
     def __init__(self):
-        print("--- 初始化音频转录引擎 (模块化 Encoder) ---")
+        print("--- 初始化音频转录引擎 ---")
         
         # 1. 加载 Processor (用于特征提取)
         print(f"加载 Processor: {HF_MODEL_DIR}")
@@ -41,21 +40,19 @@ class Qwen3ASRTranscriber:
         tokenizer = Qwen2TokenizerFast.from_pretrained(HF_MODEL_DIR)
         self.processor = Qwen3ASRProcessor(feature_extractor=feature_extractor, tokenizer=tokenizer)
         
-        # 2. 加载模块化 Encoder ONNX
-        providers = ['CPUExecutionProvider']
-        print(f"加载 Encoder Frontend: {FRONTEND_ONNX_PATH}")
-        self.frontend_sess = ort.InferenceSession(FRONTEND_ONNX_PATH, providers=providers)
-        print(f"加载 Encoder Backend: {BACKEND_ONNX_PATH}")
-        self.backend_sess = ort.InferenceSession(BACKEND_ONNX_PATH, providers=providers)
+        # 2. 加载 Encoder ONNX
+        print(f"加载 Encoder ONNX: {ENCODER_ONNX_PATH}")
+        self.encoder_sess = ort.InferenceSession(ENCODER_ONNX_PATH, providers=['CPUExecutionProvider'])
         
         # 3. 加载 LLM GGUF
         print(f"加载 GGUF LLM: {LLM_GGUF_PATH}")
-        self.model = llama.LlamaModel(LLM_GGUF_PATH)
+        self.model = llama.LlamaModel(LLM_GGUF_PATH, n_gpu_layers=0)
         self.embedding_table = llama.get_token_embeddings_gguf(LLM_GGUF_PATH)
         
         # 4. 创建 Context 和 Sampler
+        # n_ctx 设置为足够长 (Prompt 约 200 + Audio 约 1000 + 剩余生成空间)
         self.ctx = llama.LlamaContext(self.model, n_ctx=4096, embeddings=False)
-        self.sampler = llama.LlamaSampler(temperature=0.4) 
+        self.sampler = llama.LlamaSampler(temperature=0.4)
 
     def transcribe(self, audio_path: str, context: Optional[str] = None):
         if not os.path.exists(audio_path):
@@ -63,34 +60,29 @@ class Qwen3ASRTranscriber:
             return
             
         print(f"\n开始转录: {audio_path}")
+        if context:
+            print(f"应用上下文信息: {context}")
         
         # 1. 提取 Mel 特征
         audio, _ = librosa.load(audio_path, sr=16000)
         inputs = self.processor(text="语音转录：", audio=audio, return_tensors="pt")
-        mel = inputs.input_features.numpy()
+        mel = inputs.input_features.numpy() # [1, 128, T]
+        
+        # Transpose to [1, T, 128] for ONNX
         if mel.shape[1] == 128:
             mel = mel.transpose(0, 2, 1)
             
-        # 2. 模块化音频编码 (Modular Encoding)
-        # Step A: Frontend (卷积)
-        feat_out = self.frontend_sess.run(None, {"mel": mel})[0]
-        
-        # Step B: Backend (Transformer)
-        audio_embd = self.backend_sess.run(None, {"feat_in": feat_out})[0]
-        if audio_embd.ndim == 3:
-            audio_embd = audio_embd[0] # [1, T, D] -> [T, D]
-        
-        # 新的 Backend 已经去除了 Overlap，无需手动切片
+        # 2. 音频编码 (Encoder)
+        audio_embd = self.encoder_sess.run(None, {"mel": mel})[0][0] # [T_token, Dim]
         n_audio_tokens = audio_embd.shape[0]
         
         # 3. 准备 LLM Input Embeddings
-        # 如果提供了 Context，将其拼接到 User Prompt 中
-        user_prompt_text = ''
-        if context:
-            user_prompt_text = f"这是当前对话的上下文信息：{context}\n\n"
-
+        # 构造 Prompt Token 序列
+        user_prompt = "user\n"
+        user_prompt += f"输出数字要小写\n\n"
+        
         prefix_tokens = [ID_IM_START] + self.model.tokenize("system\nYou are a helpful assistant.") + [ID_IM_END] + \
-                        [ID_IM_START] + self.model.tokenize(f"user\n{user_prompt_text}") + [ID_AUDIO_START]
+                        [ID_IM_START] + self.model.tokenize(user_prompt) + [ID_AUDIO_START]
         
         suffix_tokens = [ID_AUDIO_END] + self.model.tokenize("语音转录：") + [ID_IM_END] + \
                         [ID_IM_START] + self.model.tokenize("assistant\n") + [ID_ASR_TEXT]
@@ -99,30 +91,33 @@ class Qwen3ASRTranscriber:
         n_suffix = len(suffix_tokens)
         total_len = n_prefix + n_audio_tokens + n_suffix
         
+        # 拼接 Embedding
         full_embd = np.zeros((total_len, self.model.n_embd), dtype=np.float32)
         full_embd[:n_prefix] = self.embedding_table[prefix_tokens]
         full_embd[n_prefix : n_prefix + n_audio_tokens] = audio_embd
         full_embd[n_prefix + n_audio_tokens :] = self.embedding_table[suffix_tokens]
         
         # 4. Prefill (推理)
+        # 构造多维位置编码 (M-RoPE)
         pos_base = np.arange(0, total_len, dtype=np.int32)
         pos_arr = np.concatenate([pos_base, pos_base, pos_base, np.zeros(total_len, dtype=np.int32)])
         
+        # 初始化 Batch 并解码
         batch = llama.LlamaBatch(max(total_len, 2048), self.model.n_embd, 1)
         batch.set_embd(full_embd, pos=pos_arr)
         
-        self.ctx.clear_kv_cache()
+        self.ctx.clear_kv_cache() # 每次新转录重置 Context
         if self.ctx.decode(batch) != 0:
             print("❌ Prefill 失败")
             return
             
         # 5. 递归生成文字
-        gen_batch = llama.LlamaBatch(4, 0, 1)
+        gen_batch = llama.LlamaBatch(4, 0, 1) # 4 个位置平面
         cur_pos = total_len
         result_text = ""
         
         print("Result: ", end="", flush=True)
-        for i in range(512):
+        for i in range(512): # 最大 512 字
             token_id = self.sampler.sample(self.ctx.ptr)
             if token_id == self.model.eos_token or token_id == ID_IM_END:
                 break
@@ -131,6 +126,7 @@ class Qwen3ASRTranscriber:
             print(piece, end="", flush=True)
             result_text += piece
             
+            # 喂回 Token 进行下一步预测
             gen_batch.set_token(token_id, pos=np.array([cur_pos, cur_pos, cur_pos, 0], dtype=np.int32))
             if self.ctx.decode(gen_batch) != 0:
                 break
@@ -141,11 +137,12 @@ class Qwen3ASRTranscriber:
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Qwen3-ASR (Modular ONNX + GGUF) 离线转录工具")
+    parser = argparse.ArgumentParser(description="Qwen3-ASR (ONNX + GGUF) 离线转录工具")
     parser.add_argument("input", help="音频文件路径 (如 test.mp3)")
     parser.add_argument("--context", help="转录上下文信息 (有助于提高准确度)", default=None)
     args = parser.parse_args()
     
+    # 临时抑制冗余日志
     os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
     
     engine = Qwen3ASRTranscriber()

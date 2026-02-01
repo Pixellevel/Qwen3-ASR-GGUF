@@ -62,7 +62,7 @@ def export_audio_encoder():
     
     # 准备 Dummy Data [B=1, T=100, F=128]
     dummy_mel = torch.randn(1, 100, 128)
-    discrete_path = output_dir / "qwen3_asr_encoder_discrete.onnx"
+    discrete_path = output_dir / "qwen3_asr_encoder_discrete_all.onnx"
     
     try:
         torch.onnx.export(
@@ -96,7 +96,7 @@ def export_audio_encoder():
     # 新增: seq_offset 输入 (int64 scalar)
     dummy_seq_offset = torch.tensor([0], dtype=torch.int64)
     
-    stateful_path = output_dir / "qwen3_asr_encoder_stateful.onnx"
+    stateful_path = output_dir / "qwen3_asr_encoder_stateful_all.onnx"
     
     try:
         torch.onnx.export(
