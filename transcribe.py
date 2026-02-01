@@ -21,7 +21,7 @@ from qwen_asr.core.transformers_backend.processing_qwen3_asr import Qwen3ASRProc
 HF_MODEL_DIR = r"C:\Users\Haujet\.cache\modelscope\hub\models\Qwen\Qwen3-ASR-1.7B"
 FRONTEND_ONNX_PATH = os.path.join(PROJECT_ROOT, "model", "onnx", "qwen3_asr_encoder_frontend.onnx")
 BACKEND_ONNX_PATH = os.path.join(PROJECT_ROOT, "model", "onnx", "qwen3_asr_encoder_backend.int8.onnx")
-LLM_GGUF_PATH = os.path.join(PROJECT_ROOT, "model", "qwen3_asr_llm.f16.gguf")
+LLM_GGUF_PATH = os.path.join(PROJECT_ROOT, "model", "qwen3_asr_llm.q8_0.gguf")
 
 # Special Token IDs
 ID_IM_START = 151644
@@ -54,7 +54,10 @@ class Qwen3ASRTranscriber:
         self.embedding_table = llama.get_token_embeddings_gguf(LLM_GGUF_PATH)
         
         # 4. 创建 Context 和 Sampler
-        self.ctx = llama.LlamaContext(self.model, n_ctx=4096, embeddings=False)
+        # n_ctx: 上下文长度 (8192 tokens 约可支持 10 分钟音频 + 对话)
+        # n_batch: 一次推入的最大 Token 数 (必须 >= n_ctx 以支持一次性 Prefill)
+        MAX_CTX = 8192
+        self.ctx = llama.LlamaContext(self.model, n_ctx=MAX_CTX, n_batch=MAX_CTX, embeddings=False)
         self.sampler = llama.LlamaSampler(temperature=0.4) 
 
     def transcribe(self, audio_path: str, context: Optional[str] = None):

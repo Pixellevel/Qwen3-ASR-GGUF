@@ -24,6 +24,7 @@ def setup_logging(level: int = logging.WARNING, log_file: str = os.path.join("lo
     # 获取根 logger
     root_logger = logging.getLogger('fun_asr_gguf')
     root_logger.setLevel(logging.DEBUG)  # 接收所有级别的日志
+    root_logger.propagate = False        # 禁止向上冒泡到控制台
     root_logger.handlers.clear()  # 清除已有处理器
 
 
@@ -33,7 +34,7 @@ def setup_logging(level: int = logging.WARNING, log_file: str = os.path.join("lo
         if log_dir:
             os.makedirs(log_dir, exist_ok=True)
             
-        file_handler = logging.FileHandler(log_file, encoding='utf-8')
+        file_handler = logging.FileHandler(log_file, mode='w', encoding='utf-8')
         file_handler.setLevel(logging.DEBUG) # 文件通常记录更详细的信息
         file_formatter = logging.Formatter(
             fmt='%(asctime)s - %(name)s - %(levelname)s - %(message)s'

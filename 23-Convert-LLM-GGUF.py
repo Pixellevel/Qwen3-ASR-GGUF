@@ -61,7 +61,7 @@ def main():
     # 定义转换任务列表: (输出精度类型, 后缀名)
     tasks = [
         ("f16", "f16"),
-        # ("q8_0", "q8_0")
+        ("q8_0", "q8_0")
     ]
 
     for out_type, suffix in tasks:
