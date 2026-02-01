@@ -93,14 +93,17 @@ def export_audio_encoder():
     
     dummy_mel_chunk = torch.randn(1, 50, 128)
     dummy_conv_state = torch.randn(1, 8, 128)
+    # 新增: seq_offset 输入 (int64 scalar)
+    dummy_seq_offset = torch.tensor([0], dtype=torch.int64)
+    
     stateful_path = output_dir / "qwen3_asr_encoder_stateful.onnx"
     
     try:
         torch.onnx.export(
             stateful_wrapper,
-            (dummy_mel_chunk, dummy_conv_state),
+            (dummy_mel_chunk, dummy_conv_state, dummy_seq_offset),
             str(stateful_path),
-            input_names=["mel", "conv_state"],
+            input_names=["mel", "conv_state", "seq_offset"],
             output_names=["hidden_states", "next_conv_state"],
             dynamic_axes={
                 "mel": {1: "n_frames"},
