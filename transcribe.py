@@ -1,3 +1,4 @@
+import time
 import os
 import sys
 import torch
@@ -33,16 +34,17 @@ ID_ASR_TEXT = 151704
 
 class Qwen3ASRTranscriber:
     def __init__(self):
+        t0 = time.time()
         print("--- 初始化音频转录引擎 (模块化 Encoder) ---")
         
         # 1. 加载 Processor (用于特征提取)
         print(f"加载 Processor: {HF_MODEL_DIR}")
         feature_extractor = WhisperFeatureExtractor.from_pretrained(HF_MODEL_DIR)
-        tokenizer = Qwen2TokenizerFast.from_pretrained(HF_MODEL_DIR)
+        tokenizer = Qwen2TokenizerFast.from_pretrained(HF_MODEL_DIR, fix_mistral_regex=True)
         self.processor = Qwen3ASRProcessor(feature_extractor=feature_extractor, tokenizer=tokenizer)
         
         # 2. 加载模块化 Encoder ONNX
-        providers = ['CPUExecutionProvider']
+        providers = ['DmlExecutionProvider']
         print(f"加载 Encoder Frontend: {FRONTEND_ONNX_PATH}")
         self.frontend_sess = ort.InferenceSession(FRONTEND_ONNX_PATH, providers=providers)
         print(f"加载 Encoder Backend: {BACKEND_ONNX_PATH}")
@@ -56,9 +58,10 @@ class Qwen3ASRTranscriber:
         # 4. 创建 Context 和 Sampler
         # n_ctx: 上下文长度 (8192 tokens 约可支持 10 分钟音频 + 对话)
         # n_batch: 一次推入的最大 Token 数 (必须 >= n_ctx 以支持一次性 Prefill)
-        MAX_CTX = 8192
-        self.ctx = llama.LlamaContext(self.model, n_ctx=MAX_CTX, n_batch=MAX_CTX, embeddings=False)
+        self.ctx = llama.LlamaContext(self.model, n_ctx=4096, n_batch=2048, embeddings=False)
         self.sampler = llama.LlamaSampler(temperature=0.4) 
+        
+        self.t_load_duration = time.time() - t0
 
     def transcribe(self, audio_path: str, context: Optional[str] = None):
         if not os.path.exists(audio_path):
@@ -74,14 +77,22 @@ class Qwen3ASRTranscriber:
         if mel.shape[1] == 128:
             mel = mel.transpose(0, 2, 1)
             
+        t_encoder_start = time.time()
+        
         # 2. 模块化音频编码 (Modular Encoding)
         # Step A: Frontend (卷积)
+        t_front_start = time.time()
         feat_out = self.frontend_sess.run(None, {"mel": mel})[0]
+        t_front_end = time.time()
         
         # Step B: Backend (Transformer)
+        t_back_start = time.time()
         audio_embd = self.backend_sess.run(None, {"feat_in": feat_out})[0]
         if audio_embd.ndim == 3:
             audio_embd = audio_embd[0] # [1, T, D] -> [T, D]
+        t_back_end = time.time()
+        
+        t_encoder_end = time.time()
         
         # 新的 Backend 已经去除了 Overlap，无需手动切片
         n_audio_tokens = audio_embd.shape[0]
@@ -90,7 +101,7 @@ class Qwen3ASRTranscriber:
         # 如果提供了 Context，将其拼接到 User Prompt 中
         user_prompt_text = ''
         if context:
-            user_prompt_text = f"这是当前对话的上下文信息：{context}\n\n"
+            user_prompt_text = f"{context}\n\n"
 
         prefix_tokens = [ID_IM_START] + self.model.tokenize("system\nYou are a helpful assistant.") + [ID_IM_END] + \
                         [ID_IM_START] + self.model.tokenize(f"user\n{user_prompt_text}") + [ID_AUDIO_START]
@@ -114,15 +125,28 @@ class Qwen3ASRTranscriber:
         batch = llama.LlamaBatch(max(total_len, 2048), self.model.n_embd, 1)
         batch.set_embd(full_embd, pos=pos_arr)
         
+        print(f"DEBUG: Starting Prefill. total_len={total_len}, batch_size={max(total_len, 2048)}")
         self.ctx.clear_kv_cache()
-        if self.ctx.decode(batch) != 0:
-            print("❌ Prefill 失败")
-            return
+        
+        t_prefill_start = time.time()
+        try:
+            if self.ctx.decode(batch) != 0:
+                print("❌ Prefill 失败 (decode returned non-zero)")
+                return
+        except Exception as e:
+            print(f"❌ Prefill 异常: {e}")
+            raise e
+        t_prefill_end = time.time()
+        
+        print("DEBUG: Prefill successful. Starting Generation.")
             
         # 5. 递归生成文字
         gen_batch = llama.LlamaBatch(4, 0, 1)
         cur_pos = total_len
         result_text = ""
+        
+        t_decode_start = time.time()
+        n_decode_tokens = 0
         
         print("Result: ", end="", flush=True)
         for i in range(512):
@@ -138,8 +162,26 @@ class Qwen3ASRTranscriber:
             if self.ctx.decode(gen_batch) != 0:
                 break
             cur_pos += 1
+            n_decode_tokens += 1
+        
+        t_decode_end = time.time()
             
         print("\n--- 转录结束 ---")
+        
+        # 统计报告
+        t_encoder_total = t_encoder_end - t_encoder_start
+        t_prefill_total = t_prefill_end - t_prefill_start
+        t_decode_total = t_decode_end - t_decode_start
+        
+        prefill_cps = total_len / t_prefill_total if t_prefill_total > 0 else 0
+        decode_cps = n_decode_tokens / t_decode_total if t_decode_total > 0 else 0
+        
+        print(f"\n📊 性能统计:")
+        print(f"  🔹 加载耗时: {self.t_load_duration:.3f} s")
+        print(f"  🔹 音频编码: {t_encoder_total:.3f} s (Frontend: {t_front_end - t_front_start:.3f}s, Backend: {t_back_end - t_back_start:.3f}s)")
+        print(f"  🔹 Prefill : {t_prefill_total:.3f} s | {total_len} tokens | {prefill_cps:.1f} tokens/s")
+        print(f"  🔹 Decode  : {t_decode_total:.3f} s | {n_decode_tokens} tokens | {decode_cps:.1f} tokens/s")
+        
         return result_text
 
 if __name__ == "__main__":
