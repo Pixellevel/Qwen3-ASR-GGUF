@@ -141,10 +141,10 @@ def main():
     # 3. Total Stride = 160 * 8 = 1280 samples/token
     SAMPLES_PER_TOKEN = 1280
     
-    CHUNK_TOKENS = 60 # 约 4.8s
-    OVERLAP_TOKENS = 16 # 1.28s 重叠
+    CHUNK_TOKENS = 50 # 精确 4.0s (50 * 1280 = 64000 samples)
+
     ROLLBACK_TOKENS_COUNT = 5
-    UNFIXED_CHUNK_NUM = 2
+    UNFIXED_CHUNK_NUM = 1
     
     if not os.path.exists(AUDIO_FILE):
         print(f"Error: {AUDIO_FILE} not found")
@@ -158,7 +158,7 @@ def main():
     audio_features_accum = np.zeros((0, engine.model.n_embd), dtype=np.float32)
     
     chunk_samples = CHUNK_TOKENS * SAMPLES_PER_TOKEN
-    overlap_samples = OVERLAP_TOKENS * SAMPLES_PER_TOKEN
+
     
     total_chunks = int(np.ceil(len(full_audio) / chunk_samples))
     last_all_tokens = []
@@ -172,25 +172,14 @@ def main():
         start_raw = i * chunk_samples
         end_raw = min((i + 1) * chunk_samples, len(full_audio))
         
-        if i == 0:
-            cur_audio_input = full_audio[start_raw:end_raw]
-            crop_tokens_offset = 0
-        else:
-            # 带上重叠部分供 Encoder 建立上下文
-            start_with_overlap = max(0, start_raw - overlap_samples)
-            cur_audio_input = full_audio[start_with_overlap:end_raw]
-            # 因为我们按 TOKEN 步幅取样本，这里一定能整除
-            crop_tokens_offset = (start_raw - start_with_overlap) // SAMPLES_PER_TOKEN
+        cur_audio_input = full_audio[start_raw:end_raw]
 
         t_enc_start = time.time()
         # 2. 增量 Encoder 推理
         new_embd = engine.encode_incremental(cur_audio_input)
         
-        # 裁剪重叠部分 (只保留本分片新增的特征)
-        new_embd_clean = new_embd[crop_tokens_offset:]
-        
         # 累积特征
-        audio_features_accum = np.concatenate([audio_features_accum, new_embd_clean], axis=0)
+        audio_features_accum = np.concatenate([audio_features_accum, new_embd], axis=0)
         t_enc_end = time.time()
 
         # 3. 计算 Prefix
