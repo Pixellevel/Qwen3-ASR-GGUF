@@ -55,10 +55,16 @@ class Qwen3ASRTranscriber:
         
         # 2. 加载模块化 Encoder ONNX
         
+        sess_options = ort.SessionOptions()
+        sess_options.log_severity_level = 3
+        sess_options.add_session_config_entry("session.intra_op.allow_spinning", "0")
+        sess_options.add_session_config_entry("session.inter_op.allow_spinning", "0")
+        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        
         print(f"加载 Encoder Frontend: {FRONTEND_ONNX_PATH}")
-        self.frontend_sess = ort.InferenceSession(FRONTEND_ONNX_PATH, providers=providers)
+        self.frontend_sess = ort.InferenceSession(FRONTEND_ONNX_PATH, sess_options=sess_options, providers=providers)
         print(f"加载 Encoder Backend: {BACKEND_ONNX_PATH}")
-        self.backend_sess = ort.InferenceSession(BACKEND_ONNX_PATH, providers=providers)
+        self.backend_sess = ort.InferenceSession(BACKEND_ONNX_PATH, sess_options=sess_options, providers=providers)
         
         # 3. 加载 LLM GGUF
         print(f"加载 GGUF LLM: {LLM_GGUF_PATH}")
