@@ -149,6 +149,7 @@ class Qwen3ASRTranscriber:
         n_decode_tokens = 0
         
         print("Result: ", end="", flush=True)
+        
         for i in range(512):
             token_id = self.sampler.sample(self.ctx.ptr)
             if token_id == self.model.eos_token or token_id == ID_IM_END:
@@ -164,6 +165,7 @@ class Qwen3ASRTranscriber:
             cur_pos += 1
             n_decode_tokens += 1
         
+        
         t_decode_end = time.time()
             
         print("\n--- 转录结束 ---")
@@ -173,14 +175,23 @@ class Qwen3ASRTranscriber:
         t_prefill_total = t_prefill_end - t_prefill_start
         t_decode_total = t_decode_end - t_decode_start
         
+        # 计算总耗时 (从 Encoder 开始到 Decode 结束)
+        t_total_transcribe = t_encoder_total + t_prefill_total + t_decode_total
+        
+        # 获取音频时长 (seconds)
+        audio_duration = len(audio) / 16000
+        rtf = t_total_transcribe / audio_duration if audio_duration > 0 else 0
+        
         prefill_cps = total_len / t_prefill_total if t_prefill_total > 0 else 0
         decode_cps = n_decode_tokens / t_decode_total if t_decode_total > 0 else 0
         
         print(f"\n📊 性能统计:")
         print(f"  🔹 加载耗时: {self.t_load_duration:.3f} s")
-        print(f"  🔹 音频编码: {t_encoder_total:.3f} s (Frontend: {t_front_end - t_front_start:.3f}s, Backend: {t_back_end - t_back_start:.3f}s)")
-        print(f"  🔹 Prefill : {t_prefill_total:.3f} s | {total_len} tokens | {prefill_cps:.1f} tokens/s")
-        print(f"  🔹 Decode  : {t_decode_total:.3f} s | {n_decode_tokens} tokens | {decode_cps:.1f} tokens/s")
+        print(f"  🔹 音频时长: {audio_duration:.2f} s")
+        print(f"  🔹 总耗时  : {t_total_transcribe:.3f} s (RTF: {rtf:.4f})")
+        print(f"  🔹 - 音频编码: {t_encoder_total:.3f} s (Frontend: {t_front_end - t_front_start:.3f}s, Backend: {t_back_end - t_back_start:.3f}s)")
+        print(f"  🔹 - Prefill : {t_prefill_total:.3f} s | {total_len} tokens | {prefill_cps:.1f} tokens/s")
+        print(f"  🔹 - Decode  : {t_decode_total:.3f} s | {n_decode_tokens} tokens | {decode_cps:.1f} tokens/s")
         
         return result_text
 

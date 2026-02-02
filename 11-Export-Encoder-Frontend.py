@@ -52,8 +52,8 @@ def export_frontend():
     
     frontend_path = output_dir / "qwen3_asr_encoder_frontend.onnx"
     
-    # Dummy Data [B=1, T=100, F=128]
-    dummy_mel_chunk = torch.randn(1, 100, 128)
+    # Dummy Data [B=1, T=123, F=128] (Force padding logic to be traced)
+    dummy_mel_chunk = torch.randn(1, 123, 128)
     
     try:
         torch.onnx.export(
