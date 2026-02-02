@@ -16,6 +16,16 @@ if str(PROJECT_ROOT) not in sys.path:
 from qwen_asr_gguf import llama
 from qwen_asr.core.transformers_backend.processing_qwen3_asr import Qwen3ASRProcessor
 
+# ==================== Vulkan 选项 ====================
+
+# os.environ["VK_ICD_FILENAMES"] = "none"       # 禁止 Vulkan
+# os.environ["GGML_VK_VISIBLE_DEVICES"] = "1"   # 禁止 Vulkan 用独显（强制用集显）
+# os.environ["GGML_VK_DISABLE_F16"] = "1"       # 禁止 VulkanFP16 计算（Intel集显fp16有溢出问题）
+
+providers = ['DmlExecutionProvider']
+# providers = ['CPUExecutionProvider']
+
+
 # ==========================================
 # 配置参数 (根据您的路径环境修改)
 # ==========================================
@@ -44,7 +54,7 @@ class Qwen3ASRTranscriber:
         self.processor = Qwen3ASRProcessor(feature_extractor=feature_extractor, tokenizer=tokenizer)
         
         # 2. 加载模块化 Encoder ONNX
-        providers = ['DmlExecutionProvider']
+        
         print(f"加载 Encoder Frontend: {FRONTEND_ONNX_PATH}")
         self.frontend_sess = ort.InferenceSession(FRONTEND_ONNX_PATH, providers=providers)
         print(f"加载 Encoder Backend: {BACKEND_ONNX_PATH}")
@@ -122,7 +132,9 @@ class Qwen3ASRTranscriber:
         pos_base = np.arange(0, total_len, dtype=np.int32)
         pos_arr = np.concatenate([pos_base, pos_base, pos_base, np.zeros(total_len, dtype=np.int32)])
         
-        batch = llama.LlamaBatch(max(total_len, 2048), self.model.n_embd, 1)
+        # Qwen3 使用 M-RoPE 位置编码，每个 token 需要 4 个位置值。
+        # 因此，我们需要分配 4 倍的 Batch Pos 空间以防止 Heap Corruption (Buffer Overflow)。
+        batch = llama.LlamaBatch(max(total_len * 4, 8192), self.model.n_embd, 1)
         batch.set_embd(full_embd, pos=pos_arr)
         
         print(f"DEBUG: Starting Prefill. total_len={total_len}, batch_size={max(total_len, 2048)}")
