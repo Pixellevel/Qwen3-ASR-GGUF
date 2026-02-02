@@ -3,6 +3,7 @@ import os
 import ctypes
 import numpy as np
 import gguf
+from typing import List, Union
 from pathlib import Path
 from os.path import relpath
 from typing import Union
@@ -449,11 +450,35 @@ class LlamaModel:
         self.n_embd = llama_model_n_embd(self.ptr)
         self.eos_token = llama_vocab_eos(self.vocab)
 
-    def tokenize(self, text, add_special=False, parse_special=True):
-        return text_to_tokens(self.vocab, text)
+    def tokenize(self, text: str, add_special: bool = False, parse_special: bool = True) -> List[int]:
+        """(Native) 文本转 Token ID 列表"""
+        return text_to_tokens(self.vocab, text, add_special, parse_special)
 
-    def token_to_bytes(self, token_id):
+    def detokenize(self, tokens: List[int]) -> str:
+        """(Native) Token ID 列表转文本"""
+        if not tokens: return ""
+        all_bytes = b"".join([self.token_to_bytes(tid) for tid in tokens])
+        return all_bytes.decode('utf-8', errors='replace')
+
+    def token_to_bytes(self, token_id: int) -> bytes:
+        """(Native) 单个 Token 转字节"""
         return token_to_bytes(self.vocab, token_id)
+        
+    def token_to_piece(self, token_id: int) -> str:
+        """(Native) 单个 Token 转字符串 Piece"""
+        return self.token_to_bytes(token_id).decode('utf-8', errors='replace')
+
+    def token_bos(self) -> int:
+        return llama_vocab_bos(self.vocab)
+
+    def token_eos(self) -> int:
+        return llama_vocab_eos(self.vocab)
+        
+    def token_to_id(self, text: str) -> int:
+        """(Native) 单个 Token 字符串转 ID (仅限 Exact Match)"""
+        # 利用 tokenize 来查找 ID
+        res = self.tokenize(text, add_special=False, parse_special=True)
+        return res[0] if res else -1
 
     def __del__(self):
         if hasattr(self, 'ptr') and self.ptr:
@@ -799,11 +824,11 @@ class ByteDecoder:
             return result
         return ""
 
-def text_to_tokens(vocab, text):
+def text_to_tokens(vocab, text, add_special=False, parse_special=True):
     text_bytes = text.encode("utf-8")
     n_tokens_max = len(text_bytes) + 32
     tokens = (llama_token * n_tokens_max)()
-    n = llama_tokenize(vocab, text_bytes, len(text_bytes), tokens, n_tokens_max, False, True)
+    n = llama_tokenize(vocab, text_bytes, len(text_bytes), tokens, n_tokens_max, add_special, parse_special)
     return [tokens[i] for i in range(n)] if n >= 0 else []
 
 def token_to_bytes(vocab, token_id):

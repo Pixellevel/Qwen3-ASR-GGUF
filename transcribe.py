@@ -1,20 +1,20 @@
 import time
 import os
 import sys
-import torch
+import codecs
+# import torch
 import numpy as np
 import onnxruntime as ort
 import librosa
 from pathlib import Path
-from typing import Optional
-from transformers import WhisperFeatureExtractor, Qwen2TokenizerFast
+from typing import Optional, List
+# from transformers import WhisperFeatureExtractor, Qwen2TokenizerFast <-- Removed
 
-# 添加本地 Qwen-ASR GGUF 适配库路径
+# 添加本地 Qwen-ASR-GGUF 适配库路径
 PROJECT_ROOT = Path(__file__).parent.absolute()
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 from qwen_asr_gguf import llama
-from qwen_asr.core.transformers_backend.processing_qwen3_asr import Qwen3ASRProcessor
 
 # ==================== Vulkan 选项 ====================
 
@@ -29,7 +29,6 @@ providers = ['DmlExecutionProvider']
 # ==========================================
 # 配置参数 (根据您的路径环境修改)
 # ==========================================
-HF_MODEL_DIR = r"C:\Users\Haujet\.cache\modelscope\hub\models\Qwen\Qwen3-ASR-1.7B"
 FRONTEND_ONNX_PATH = os.path.join(PROJECT_ROOT, "model", "onnx", "qwen3_asr_encoder_frontend.onnx")
 BACKEND_ONNX_PATH = os.path.join(PROJECT_ROOT, "model", "onnx", "qwen3_asr_encoder_backend.int8.onnx")
 LLM_GGUF_PATH = os.path.join(PROJECT_ROOT, "model", "qwen3_asr_llm.q8_0.gguf")
@@ -42,16 +41,42 @@ ID_AUDIO_END = 151670
 ID_AUDIO_PAD = 151676
 ID_ASR_TEXT = 151704
 
+class FastWhisperMel:
+    """完全基于 NumPy 和 Librosa 的 Mel 提取器 (替代 Transformers)"""
+    def __init__(self, filter_path):
+        self.filters = np.load(filter_path) # (201, 128)
+        
+    def __call__(self, audio):
+        # 1. STFT (Reflect padding, Hann window)
+        stft = librosa.stft(audio, n_fft=400, hop_length=160, window='hann', center=True)
+        # 2. Power Spectrum
+        magnitudes = np.abs(stft) ** 2 
+        # 3. Mel Filterbank
+        mel_spec = np.dot(self.filters.T, magnitudes) # (128, 201) x (201, T) -> (128, T)
+        # 4. Log10
+        log_spec = np.log10(np.maximum(mel_spec, 1e-10))
+        # 5. Dynamic Range Compression
+        log_spec = np.maximum(log_spec, np.max(log_spec) - 8.0)
+        # 6. Scaling
+        log_spec = (log_spec + 4.0) / 4.0
+        return log_spec.T.astype(np.float32) # (T, 128)
+
 class Qwen3ASRTranscriber:
     def __init__(self):
         t0 = time.time()
         print("--- 初始化音频转录引擎 (模块化 Encoder) ---")
         
-        # 1. 加载 Processor (用于特征提取)
-        print(f"加载 Processor: {HF_MODEL_DIR}")
-        feature_extractor = WhisperFeatureExtractor.from_pretrained(HF_MODEL_DIR)
-        tokenizer = Qwen2TokenizerFast.from_pretrained(HF_MODEL_DIR, fix_mistral_regex=True)
-        self.processor = Qwen3ASRProcessor(feature_extractor=feature_extractor, tokenizer=tokenizer)
+        if str(PROJECT_ROOT) not in sys.path:
+            sys.path.insert(0, str(PROJECT_ROOT))
+
+        # 1. 加载 Mel 滤波器
+        print(f"加载 Custom Mel Filters...")
+        # 假设 filter 在 model/mel_filters.npy，如果不存在需要提示生成
+        filter_path = os.path.join(PROJECT_ROOT, "model", "mel_filters.npy")
+        if not os.path.exists(filter_path):
+             raise FileNotFoundError(f"找不到 Mel 滤波器文件: {filter_path}。请先运行 export_mel_filters.py")
+        self.mel_extractor = FastWhisperMel(filter_path)
+        
         
         # 2. 加载模块化 Encoder ONNX
         
@@ -66,16 +91,27 @@ class Qwen3ASRTranscriber:
         print(f"加载 Encoder Backend: {BACKEND_ONNX_PATH}")
         self.backend_sess = ort.InferenceSession(BACKEND_ONNX_PATH, sess_options=sess_options, providers=providers)
         
+        # 模型预热 (Warmup)
+        dummy_mel = np.random.randn(1, 200, 128).astype(np.float32)
+        dummy_feat = self.frontend_sess.run(None, {"mel": dummy_mel})[0]
+        self.backend_sess.run(None, {"feat_in": dummy_feat})
+        
         # 3. 加载 LLM GGUF
         print(f"加载 GGUF LLM: {LLM_GGUF_PATH}")
         self.model = llama.LlamaModel(LLM_GGUF_PATH)
         self.embedding_table = llama.get_token_embeddings_gguf(LLM_GGUF_PATH)
         
+        # 更新 Token IDs 为原生查询结果
+        global ID_IM_START, ID_IM_END, ID_AUDIO_START, ID_AUDIO_END, ID_ASR_TEXT
+        ID_IM_START = self.model.token_to_id("<|im_start|>")
+        ID_IM_END = self.model.token_to_id("<|im_end|>")
+        ID_AUDIO_START = self.model.token_to_id("<|audio_start|>")
+        ID_AUDIO_END = self.model.token_to_id("<|audio_end|>")
+        ID_ASR_TEXT = self.model.token_to_id("<asr_text>")
+
         # 4. 创建 Context 和 Sampler
-        # n_ctx: 上下文长度 (8192 tokens 约可支持 10 分钟音频 + 对话)
-        # n_batch: 一次推入的最大 Token 数 (必须 >= n_ctx 以支持一次性 Prefill)
-        self.ctx = llama.LlamaContext(self.model, n_ctx=4096, n_batch=2048, embeddings=False)
-        self.sampler = llama.LlamaSampler(temperature=0.4) 
+        self.ctx = llama.LlamaContext(self.model, n_ctx=4096, n_batch=4096, embeddings=False)
+        self.sampler = llama.LlamaSampler(temperature=0) 
         
         self.t_load_duration = time.time() - t0
 
@@ -88,10 +124,8 @@ class Qwen3ASRTranscriber:
         
         # 1. 提取 Mel 特征
         audio, _ = librosa.load(audio_path, sr=16000)
-        inputs = self.processor(text="语音转录：", audio=audio, return_tensors="pt")
-        mel = inputs.input_features.numpy()
-        if mel.shape[1] == 128:
-            mel = mel.transpose(0, 2, 1)
+        mel = self.mel_extractor(audio) # [T, 128]
+        mel = mel[np.newaxis, ...] # [1, T, 128]
             
         t_encoder_start = time.time()
         
@@ -109,8 +143,6 @@ class Qwen3ASRTranscriber:
         t_back_end = time.time()
         
         t_encoder_end = time.time()
-        
-        # 新的 Backend 已经去除了 Overlap，无需手动切片
         n_audio_tokens = audio_embd.shape[0]
         
         # 3. 准备 LLM Input Embeddings
@@ -168,20 +200,31 @@ class Qwen3ASRTranscriber:
         
         print("Result: ", end="", flush=True)
         
+        # BPE 增量解码器 (处理多字节字符分割)
+        decoder = codecs.getincrementaldecoder("utf-8")(errors='replace')
+        
         for i in range(512):
             token_id = self.sampler.sample(self.ctx.ptr)
             if token_id == self.model.eos_token or token_id == ID_IM_END:
                 break
-                
-            piece = self.model.token_to_bytes(token_id).decode('utf-8', errors='replace')
-            print(piece, end="", flush=True)
-            result_text += piece
             
+            # 优先提交下一次解码任务 (Compute First)
             gen_batch.set_token(token_id, pos=np.array([cur_pos, cur_pos, cur_pos, 0], dtype=np.int32))
-            if self.ctx.decode(gen_batch) != 0:
-                break
+            ret = self.ctx.decode(gen_batch)
             cur_pos += 1
             n_decode_tokens += 1
+            
+            # 后处理耗时操作 (IO / Text Processing)
+            # 获取 Token 字节并流式解码
+            delta = decoder.decode(self.model.token_to_bytes(token_id), final=False)
+            if delta:
+                print(delta, end="", flush=True)
+                result_text += delta
+            
+            # 检查解码结果
+            if ret != 0:
+                print(f"❌ Decode Error: {ret}")
+                break
         
         
         t_decode_end = time.time()

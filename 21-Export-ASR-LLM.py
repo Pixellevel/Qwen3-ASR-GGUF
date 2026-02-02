@@ -21,7 +21,7 @@ def extract_llm_weights():
     # Using the class directly ensures we use the local code we analyzed
     model = Qwen3ASRForConditionalGeneration.from_pretrained(MODEL_DIR, trust_remote_code=True, device_map="cpu")
     
-    output_dir = Path(EXPORT_DIR) / "llm_hf"
+    output_dir = Path(EXPORT_DIR) / "decoder_hf"
     output_dir.mkdir(parents=True, exist_ok=True)
     
     print(f"Extracting LLM (Thinker) weights to: {output_dir}")

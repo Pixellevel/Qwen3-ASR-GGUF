@@ -6,7 +6,7 @@ from pathlib import Path
 # 1. 路径设置
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 CONVERT_LIB_DIR = os.path.join(PROJECT_ROOT, "qwen_asr_gguf")
-MODEL_DIR = os.path.join(PROJECT_ROOT, "model", "llm_hf")
+MODEL_DIR = os.path.join(PROJECT_ROOT, "model", "decoder_hf")
 OUTPUT_GGUF = os.path.join(PROJECT_ROOT, "model", "qwen3_asr_llm.gguf")
 
 # 确保可以导入转换库
