@@ -63,8 +63,8 @@ def export_frontend():
             input_names=["mel"],
             output_names=["feat_out"],
             dynamic_axes={
-                "mel": {1: "n_frames"},
-                "feat_out": {1: "n_tokens"}
+                "mel": {0: "batch", 1: "n_frames"},
+                "feat_out": {0: "batch", 1: "n_tokens"}
             },
             opset_version=17,
             do_constant_folding=True,

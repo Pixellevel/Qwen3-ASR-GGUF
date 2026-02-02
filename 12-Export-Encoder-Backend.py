@@ -69,8 +69,8 @@ def export_backend_int8():
             input_names=["feat_in"],
             output_names=["hidden_states"],
             dynamic_axes={
-                "feat_in": {1: "n_tokens"},
-                "hidden_states": {1: "n_tokens"}
+                "feat_in": {0: "batch", 1: "n_tokens"},
+                "hidden_states": {0: "batch", 1: "n_tokens"}
             },
             opset_version=17,
             do_constant_folding=True,
