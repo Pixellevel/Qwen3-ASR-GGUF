@@ -185,7 +185,7 @@ class InfiniteStreamer31:
             print("\n\nEncoder Worker Terminated Safely.")
         self.enc_proc.join()
 
-    def run_llm_buffered(self, audio_embd, prefix_text, is_last_chunk=False):
+    def run_llm_buffered(self, audio_embd, prefix_text, is_last_chunk=False, language: str = None):
         import numpy as np
         import codecs
         from qwen_asr_gguf import llama
@@ -199,8 +199,13 @@ class InfiniteStreamer31:
         prefix_tokens = [self.ID_IM_START] + tk(f"system\n{system_text}") + [self.ID_IM_END] + \
                         [self.ID_IM_START] + tk(f"user\n{user_prompt_text}") + [self.ID_AUDIO_START]
         
+        # 构建 Assistant 引导部分
+        assistant_prompt = "assistant\n"
+        if language:
+            assistant_prompt += f"language {language}"
+
         suffix_tokens = [self.ID_AUDIO_END] + tk("语音转录：") + [self.ID_IM_END] + \
-                        [self.ID_IM_START] + tk("assistant\n") + [self.ID_ASR_TEXT] + \
+                        [self.ID_IM_START] + tk(assistant_prompt) + [self.ID_ASR_TEXT] + \
                         tk(prefix_text)
 
         n_prefix = len(prefix_tokens)

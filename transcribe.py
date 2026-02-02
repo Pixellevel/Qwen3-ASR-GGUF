@@ -115,12 +115,11 @@ class Qwen3ASRTranscriber:
         
         self.t_load_duration = time.time() - t0
 
-    def transcribe(self, audio_path: str, context: Optional[str] = None):
+    def transcribe(self, audio_path: str, context: str = "", language: str = None):
         if not os.path.exists(audio_path):
             print(f"❌ 找不到音频文件: {audio_path}")
             return
-            
-        print(f"\n开始转录: {audio_path}")
+        print(f"--- Processing {audio_path} ---")
         
         # 1. 提取 Mel 特征
         audio, _ = librosa.load(audio_path, sr=16000)
@@ -129,7 +128,7 @@ class Qwen3ASRTranscriber:
             
         t_encoder_start = time.time()
         
-        # 2. 模块化音频编码 (Modular Encoding)
+        # 2. 编码器前馈
         # Step A: Frontend (卷积)
         t_front_start = time.time()
         feat_out = self.frontend_sess.run(None, {"mel": mel})[0]
@@ -138,15 +137,18 @@ class Qwen3ASRTranscriber:
         # Step B: Backend (Transformer)
         t_back_start = time.time()
         audio_embd = self.backend_sess.run(None, {"feat_in": feat_out})[0]
-        if audio_embd.ndim == 3:
-            audio_embd = audio_embd[0] # [1, T, D] -> [T, D]
+        if audio_embd.ndim == 3: audio_embd = audio_embd[0] # [T_ds, 1024]
         t_back_end = time.time()
         
         t_encoder_end = time.time()
         n_audio_tokens = audio_embd.shape[0]
         
         # 3. 准备 LLM Input Embeddings
-        # 如果提供了 Context，将其拼接到 User Prompt 中
+        # Prompt 格式:
+        # <|im_start|>system\n...<|im_end|>
+        # <|im_start|>user\n{context}\n\n<|audio_start|>{Audio Embeds}<|audio_end|>语音转录：<|im_end|>
+        # <|im_start|>assistant\n
+        
         user_prompt_text = ''
         if context:
             user_prompt_text = f"{context}\n\n"
@@ -154,8 +156,14 @@ class Qwen3ASRTranscriber:
         prefix_tokens = [ID_IM_START] + self.model.tokenize("system\nYou are a helpful assistant.") + [ID_IM_END] + \
                         [ID_IM_START] + self.model.tokenize(f"user\n{user_prompt_text}") + [ID_AUDIO_START]
         
+        # 构建 Assistant 引导部分
+        # 格式: <|audio_end|>语音转录：<|im_end|><|im_start|>assistant\n[language {Lang}]<asr_text>
+        assistant_prompt = "assistant\n"
+        if language:
+            assistant_prompt += f"language {language}"
+            
         suffix_tokens = [ID_AUDIO_END] + self.model.tokenize("语音转录：") + [ID_IM_END] + \
-                        [ID_IM_START] + self.model.tokenize("assistant\n") + [ID_ASR_TEXT]
+                        [ID_IM_START] + self.model.tokenize(assistant_prompt) + [ID_ASR_TEXT]
         
         n_prefix = len(prefix_tokens)
         n_suffix = len(suffix_tokens)
@@ -261,9 +269,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Qwen3-ASR (Modular ONNX + GGUF) 离线转录工具")
     parser.add_argument("input", help="音频文件路径 (如 test.mp3)")
     parser.add_argument("--context", help="转录上下文信息 (有助于提高准确度)", default=None)
+    parser.add_argument("--language", help="强制指定语言 (如 'Chinese', 'English')", default=None)
     args = parser.parse_args()
     
     os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
     
     engine = Qwen3ASRTranscriber()
-    engine.transcribe(args.input, context=args.context)
+    engine.transcribe(args.input, context=args.context, language=args.language)
