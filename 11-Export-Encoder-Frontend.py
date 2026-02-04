@@ -13,6 +13,7 @@ if str(CUSTOM_MODEL_DIR) not in sys.path:
 # 导入自定义组件
 from modeling_qwen3_asr_onnx import EncoderConvFrontend
 from export_config import MODEL_DIR, EXPORT_DIR
+import torch.export
 
 def export_frontend():
     """
@@ -22,7 +23,7 @@ def export_frontend():
     
     # 1. 加载模型
     print(f"正在加载原始模型权重: {MODEL_DIR}")
-    from qwen_asr.core.transformers_backend import Qwen3ASRForConditionalGeneration
+    from modeling_qwen3_asr import Qwen3ASRForConditionalGeneration
     
     try:
         full_model = Qwen3ASRForConditionalGeneration.from_pretrained(
@@ -50,11 +51,19 @@ def export_frontend():
     frontend_wrapper = EncoderConvFrontend(encoder)
     frontend_wrapper.eval()
     
-    frontend_path = output_dir / "qwen3_asr_encoder_frontend.onnx"
+    frontend_path = output_dir / "qwen3_asr_encoder_frontend.fp32.onnx"
     
     # Dummy Data [B=1, T=123, F=128] (Force padding logic to be traced)
     dummy_mel_chunk = torch.randn(1, 123, 128)
     
+    # 定义动态形状 (使用 Dynamo 推荐的 dynamic_shapes)
+    dynamic_shapes = {
+        "mel": {
+            0: torch.export.Dim("batch", min=1, max=16),
+            1: torch.export.Dim("n_frames", min=1, max=4096)
+        }
+    }
+
     try:
         torch.onnx.export(
             frontend_wrapper,
@@ -62,18 +71,41 @@ def export_frontend():
             str(frontend_path),
             input_names=["mel"],
             output_names=["feat_out"],
-            dynamic_axes={
-                "mel": {0: "batch", 1: "n_frames"},
-                "feat_out": {0: "batch", 1: "n_tokens"}
-            },
-            opset_version=17,
+            dynamic_shapes=dynamic_shapes,
+            opset_version=18,
             do_constant_folding=True,
-            **({"dynamo": False} if hasattr(torch.onnx, "export") else {})
+            dynamo=True,
         )
-        print(f"✅ 卷积前端模型已保存至: {frontend_path}")
+        print(f"✅ 卷积前端模型 (FP32) 已保存至: {frontend_path}")
     except Exception:
         import traceback
-        print(f"❌ 导出前端模型失败:")
+        print(f"❌ 导出前端模型 (FP32) 失败:")
+        traceback.print_exc()
+
+    # 3. 导出 FP16 版本 (针对 GPU DML 优化)
+    print("\n[Exporting] Conv Frontend (FP16)...")
+    try:
+        # 将模型转为半精度
+        frontend_wrapper.half()
+        dummy_mel_half = dummy_mel_chunk.half()
+        
+        frontend_fp16_path = output_dir / "qwen3_asr_encoder_frontend.fp16.onnx"
+        
+        torch.onnx.export(
+            frontend_wrapper,
+            (dummy_mel_half,),
+            str(frontend_fp16_path),
+            input_names=["mel"],
+            output_names=["feat_out"],
+            dynamic_shapes=dynamic_shapes,
+            opset_version=18,
+            do_constant_folding=True,
+            dynamo=True,
+        )
+        print(f"✅ 卷积前端模型 (FP16) 已保存至: {frontend_fp16_path}")
+    except Exception:
+        import traceback
+        print(f"❌ 导出前端模型 (FP16) 失败:")
         traceback.print_exc()
 
 if __name__ == "__main__":

@@ -31,15 +31,18 @@ class EncoderConvFrontend(nn.Module):
         chunk_size = self.chunk_size
         
         # 1. 物理分块与填充 (对齐官方行为)
+        # 使用 torch 操作计算 pad_len，避免 python if
         pad_len = (chunk_size - (t % chunk_size)) % chunk_size
-        if pad_len > 0:
-            mel = F.pad(mel, (0, 0, 0, pad_len))
+        
+        # 即使 pad_len 为 0，F.pad(..., (0, 0, 0, 0)) 也是安全的，且能生成静态图
+        mel = F.pad(mel, (0, 0, 0, pad_len))
         
         t_padded = t + pad_len
         num_chunks = t_padded // chunk_size
         
         # [B, T_p, D] -> [B * N, chunk_size, D]
-        chunks = mel.view(b * num_chunks, chunk_size, d)
+        # 优化技巧：使用 unflatten + flatten 替代 view，对 DirectML 更友好
+        chunks = mel.unflatten(1, (num_chunks, chunk_size)).flatten(0, 1)
         x = chunks.transpose(1, 2).unsqueeze(1) # [B*N, 1, D, chunk_size]
         
         # 2. 卷积下采样
@@ -49,18 +52,31 @@ class EncoderConvFrontend(nn.Module):
         
         # 3. 展平与映射
         bn, c, f, tn = x.size() # tn = 13
-        x = x.permute(0, 3, 1, 2).contiguous().view(bn, tn, c * f)
+        # 使用 view 之前确保 contiguous，并尽量使用 flatten 减少 view 的复杂度
+        x = x.permute(0, 3, 1, 2).contiguous().flatten(2) # [bn, tn, c*f]
         hidden_states = self.encoder.conv_out(x) # [B*N, 13, H]
         
         # 4. 合并并还原形状到 [B, N*13, H]
-        hidden_states = hidden_states.view(b, num_chunks * tn, -1)
+        # 优化技巧：使用 unflatten + flatten 替代 view
+        hidden_states = hidden_states.unflatten(0, (b, num_chunks)).flatten(1, 2)
         
         # 5. 长度对齐 (移除末尾因为 Padding 产生的多余 Token)
+        # 用 PyTorch 逻辑实现：total_tokens = (t // chunk_size) * 13 + rem_tokens
+        full_chunks = t // chunk_size
         input_lengths_leave = t % chunk_size
-        feat_lengths = (input_lengths_leave - 1) // 2 + 1 if input_lengths_leave > 0 else 0
-        rem_tokens = ((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1 if feat_lengths > 0 else 0
-        total_tokens = (t // chunk_size) * tn + rem_tokens
         
+        # 下采样逻辑: (L - 1) // 2 + 1 发生三次，对应 100 -> 13
+        # SymInt 运算下，-1 // 2 = -1, 因此 -1 // 2 + 1 = 0，已能正确处理 input_lengths_leave=0
+        feat_lengths = (input_lengths_leave - 1) // 2 + 1
+        rem_tokens = (feat_lengths - 1) // 2 + 1
+        rem_tokens = (rem_tokens - 1) // 2 + 1
+        
+        # 这里需要注意，当 input_lengths_leave 为 0 时，rem_tokens 应该为 0
+        
+        total_tokens = full_chunks * tn + rem_tokens
+        
+        # 使用 [:, :total_tokens, :] 进行切片。
+        # 在 Dynamo 模式下，total_tokens 作为一个符号标量是没问题的。
         hidden_states = hidden_states[:, :total_tokens, :]
         return hidden_states
 
@@ -95,7 +111,8 @@ class EncoderTransformerBackend(nn.Module):
         # n_window_infer = 800 frames = 8 chunks * 13 tokens = 104 tokens
         window_size = 104 
         
-        hidden_states_flattened = hidden_states.view(-1, h)
+        # 优化技巧：使用 flatten 替代 view(-1, ...)
+        hidden_states_flattened = hidden_states.flatten(0, 1)
         
         # 生成符号化 cu_seqlens 以支持 ONNX 导出
         num_windows = (t + window_size - 1) // window_size
@@ -103,15 +120,16 @@ class EncoderTransformerBackend(nn.Module):
         cu_seqlens_single = torch.cat([steps, torch.tensor([t], device=device, dtype=steps.dtype)])
         
         if b > 1:
-            offsets = (torch.arange(0, b, device=device) * t).view(-1, 1)
-            cu_seqlens = (cu_seqlens_single.view(1, -1) + offsets).view(-1).to(torch.int32)
+            offsets = (torch.arange(0, b, device=device) * t).unflatten(0, (b, 1))
+            cu_seqlens = (cu_seqlens_single.unflatten(0, (1, -1)) + offsets).flatten(0, 1).to(torch.int32)
         else:
             cu_seqlens = cu_seqlens_single.to(torch.int32)
             
         for layer in self.encoder.layers:
             hidden_states_flattened = layer(hidden_states_flattened, cu_seqlens)[0]
             
-        hidden_states = hidden_states_flattened.view(b, t, h)
+        # 优化技巧：使用 unflatten 还原维度
+        hidden_states = hidden_states_flattened.unflatten(0, (b, t))
         
         # 3. 后投影
         hidden_states = self.encoder.ln_post(hidden_states)

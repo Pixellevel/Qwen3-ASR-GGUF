@@ -24,7 +24,7 @@ def export_backend_int8():
     
     # 1. 加载模型
     print(f"正在加载原始模型权重: {MODEL_DIR}")
-    from qwen_asr.core.transformers_backend import Qwen3ASRForConditionalGeneration
+    from modeling_qwen3_asr import Qwen3ASRForConditionalGeneration
     
     try:
         full_model = Qwen3ASRForConditionalGeneration.from_pretrained(
@@ -72,9 +72,9 @@ def export_backend_int8():
                 "feat_in": {0: "batch", 1: "n_tokens"},
                 "hidden_states": {0: "batch", 1: "n_tokens"}
             },
-            opset_version=17,
+            opset_version=18,
             do_constant_folding=True,
-            **({"dynamo": False} if hasattr(torch.onnx, "export") else {})
+            dynamo=True,
         )
         print(f"✅ FP32 模型已导出。")
     except Exception:
@@ -84,7 +84,7 @@ def export_backend_int8():
         return
 
     # 3. 动态量化为 INT8
-    print("\n[Stage 2/2] 正在进行 INT8 动态量化 (针对 MatMul)...")
+    print("\n[Stage 2/3] 正在进行 INT8 动态量化 (针对 MatMul)...")
     int8_path = output_dir / "qwen3_asr_encoder_backend.int8.onnx"
     
     try:
@@ -97,11 +97,38 @@ def export_backend_int8():
             weight_type=QuantType.QUInt8
         )
         print(f"✅ INT8 量化模型已保存至: {int8_path}")
-        
-        # 可选：删除临时 FP32 文件
-        # os.remove(fp32_path)
     except Exception as e:
         print(f"❌ 量化失败: {e}")
+
+    # 4. 导出 FP16 版本
+    print("\n[Stage 3/3] 导出 FP16 模型 (针对 GPU)...")
+    fp16_path = output_dir / "qwen3_asr_encoder_backend.fp16.onnx"
+    try:
+        # 重新加载 wrapper 或转换
+        backend_wrapper.float() # 回到 FP32
+        backend_wrapper.half()  # 转为 FP16
+        
+        dummy_feat_half = dummy_feat_in.half()
+        
+        torch.onnx.export(
+            backend_wrapper,
+            (dummy_feat_half,),
+            str(fp16_path),
+            input_names=["feat_in"],
+            output_names=["hidden_states"],
+            dynamic_axes={
+                "feat_in": {0: "batch", 1: "n_tokens"},
+                "hidden_states": {0: "batch", 1: "n_tokens"}
+            },
+            opset_version=18,
+            do_constant_folding=True,
+            dynamo=True
+        )
+        print(f"✅ Backend FP16 模型已保存至: {fp16_path}")
+    except Exception as e:
+        import traceback
+        print(f"❌ 导出 FP16 失败: {e}")
+        traceback.print_exc()
 
 if __name__ == "__main__":
     export_backend_int8()

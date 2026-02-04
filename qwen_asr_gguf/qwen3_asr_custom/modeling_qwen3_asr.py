@@ -84,7 +84,7 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     if n_rep == 1:
         return hidden_states
     hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
-    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+    return hidden_states.flatten(1, 2)
 
 
 def eager_attention_forward(
@@ -185,9 +185,10 @@ class Qwen3ASRTextAttention(nn.Module):
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
-        query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        # 优化技巧：直接 unflatten 最后维度，中间维度由系统自动继承，不使用显式 view(hidden_shape)
+        query_states = self.q_norm(self.q_proj(hidden_states).unflatten(-1, (self.config.num_attention_heads, self.head_dim))).transpose(1, 2)
+        key_states = self.k_norm(self.k_proj(hidden_states).unflatten(-1, (self.config.num_key_value_heads, self.head_dim))).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).unflatten(-1, (self.config.num_key_value_heads, self.head_dim)).transpose(1, 2)
 
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
@@ -212,7 +213,9 @@ class Qwen3ASRTextAttention(nn.Module):
             **kwargs,
         )
 
-        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        # 优化技巧：使用 flatten(1, 2) 将 (batch, heads, seq, dim) 转为 (batch, seq, heads*dim)
+        # 避免计算 input_shape 的具体值
+        attn_output = attn_output.transpose(1, 2).flatten(2).contiguous()
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
 
@@ -485,9 +488,10 @@ class Qwen3ASRAudioAttention(nn.Module):
 
         seq_length, _ = hidden_states.size()
 
-        query_states = self.q_proj(hidden_states).reshape(seq_length, self.num_heads, -1)
-        key_states = self.k_proj(hidden_states).reshape(seq_length, self.num_heads, -1)
-        value_states = self.v_proj(hidden_states).reshape(seq_length, self.num_heads, -1)
+        # 优化技巧：避免使用 seq_length 显式生成形状
+        query_states = self.q_proj(hidden_states).unflatten(-1, (self.num_heads, self.head_dim))
+        key_states = self.k_proj(hidden_states).unflatten(-1, (self.num_heads, self.head_dim))
+        value_states = self.v_proj(hidden_states).unflatten(-1, (self.num_heads, self.head_dim))
 
         query_states = query_states.transpose(0, 1).unsqueeze(0)
         key_states = key_states.transpose(0, 1).unsqueeze(0)
@@ -514,7 +518,9 @@ class Qwen3ASRAudioAttention(nn.Module):
             **kwargs,
         )
 
-        attn_output = attn_output.reshape(seq_length, -1).contiguous()
+        # attn_output shape is [1, num_heads, seq_length, head_dim] -> transpose(1,2) -> [1, seq_length, num_heads, head_dim]
+        # squeeze(0) and flatten(1) to get [seq_length, num_heads * head_dim]
+        attn_output = attn_output.squeeze(0).flatten(1).contiguous()
         attn_output = self.out_proj(attn_output)
 
         return attn_output
@@ -583,7 +589,9 @@ class SinusoidsPositionEmbedding(nn.Module):
             raise ValueError("SinusoidsPositionEmbedding needs even channels input")
         log_timescale_increment = np.log(max_timescale) / (channels // 2 - 1)
         inv_timescales = torch.exp(-log_timescale_increment * torch.arange(channels // 2).float())
-        scaled_time = torch.arange(length)[:, np.newaxis] * inv_timescales[np.newaxis, :]
+        # 优化技巧：使用 ones + cumsum 代替 arange 以继承形状，对 DirectML 更友好
+        positions = torch.ones((length,), dtype=torch.float32).cumsum(0) - 1
+        scaled_time = positions.unsqueeze(-1) * inv_timescales.unsqueeze(0)
         self.register_buffer(
             "positional_embedding",
             torch.cat([torch.sin(scaled_time), torch.cos(scaled_time)], dim=1),
@@ -707,7 +715,7 @@ class Qwen3ASRAudioEncoder(Qwen3ASRPreTrainedModel):
             padded_embeds.append(padded_embed)
         padded_embed = torch.cat(padded_embeds, dim=0)
         b, c, f, t = padded_embed.size()
-        padded_embed = self.conv_out(padded_embed.permute(0, 3, 1, 2).contiguous().view(b, t, c * f))
+        padded_embed = self.conv_out(padded_embed.permute(0, 3, 1, 2).contiguous().flatten(2))
 
         positional_embedding = (
             self.positional_embedding.positional_embedding[: padded_embed.shape[1], :]

@@ -36,8 +36,8 @@ ROLLBACK_VAR_COUNT = 5    # 回滚/撤销的 Token 数量 (不显示的延迟缓
 
 # 固定路径配置
 PROJECT_ROOT = Path(__file__).parent.absolute()
-FRONTEND_ONNX_PATH = os.path.join(PROJECT_ROOT, "model", "onnx", "qwen3_asr_encoder_frontend.onnx")
-BACKEND_ONNX_PATH = os.path.join(PROJECT_ROOT, "model", "onnx", "qwen3_asr_encoder_backend.int8.onnx")
+FRONTEND_ONNX_PATH = os.path.join(PROJECT_ROOT, "model", "onnx", "qwen3_asr_encoder_frontend.fp32.onnx")
+BACKEND_ONNX_PATH = os.path.join(PROJECT_ROOT, "model", "onnx", "qwen3_asr_encoder_backend.fp32.onnx")
 LLM_GGUF_PATH = os.path.join(PROJECT_ROOT, "model", "qwen3_asr_llm.q8_0.gguf")
 
 # ==========================================
@@ -82,7 +82,7 @@ def encoder_worker_proc(to_enc_q, from_enc_q):
     
     # GPU Warmup: 跑一段随机音频以触发 Shader 编译和显存分配
     # 这将 1-2 秒的“冷启动”耗时提前到初始化阶段
-    dummy_wav = np.random.randn(int(16000 * 2)).astype(np.float32) # 2秒随机噪声
+    dummy_wav = np.random.randn(int(16000 * 40)).astype(np.float32) # 2秒随机噪声
     dummy_mel = mel_extractor(dummy_wav)
     dummy_input = dummy_mel.T[np.newaxis, ...].astype(np.float32)
     feat_out = frontend_sess.run(None, {"mel": dummy_input})[0]
@@ -204,7 +204,7 @@ class InfiniteStreamer31:
         if language:
             assistant_prompt += f"language {language}"
 
-        suffix_tokens = [self.ID_AUDIO_END] + tk("语音转录：") + [self.ID_IM_END] + \
+        suffix_tokens = [self.ID_AUDIO_END] + tk("数字用0123456789，语音转录：") + [self.ID_IM_END] + \
                         [self.ID_IM_START] + tk(assistant_prompt) + [self.ID_ASR_TEXT] + \
                         tk(prefix_text)
 
