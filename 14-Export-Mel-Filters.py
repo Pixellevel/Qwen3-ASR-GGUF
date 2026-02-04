@@ -3,12 +3,12 @@ import os
 import numpy as np
 import torch
 from transformers import WhisperFeatureExtractor
+from export_config import MODEL_DIR, EXPORT_DIR
 
-HF_MODEL_DIR = r"C:\Users\Haujet\.cache\modelscope\hub\models\Qwen\Qwen3-ASR-1.7B"
-OUTPUT_FILE = r"d:\qwen3-asr\model\mel_filters.npy"
+OUTPUT_FILE = EXPORT_DIR / "mel_filters.npy"
 
 def main():
-    fe = WhisperFeatureExtractor.from_pretrained(HF_MODEL_DIR)
+    fe = WhisperFeatureExtractor.from_pretrained(MODEL_DIR)
     # The filters are usually in fe.mel_filters
     if hasattr(fe, 'mel_filters'):
         filters = np.array(fe.mel_filters)

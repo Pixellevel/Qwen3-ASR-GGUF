@@ -7,4 +7,4 @@ model_home = Path('~/.cache/modelscope/hub/models/Qwen').expanduser()
 MODEL_DIR =  model_home / 'Qwen3-ASR-0.6B'
 
 # [导出目标路径] 转换后的 ONNX, GGUF 和权重汇总目录
-EXPORT_DIR = r'./model'
+EXPORT_DIR = Path('./model')

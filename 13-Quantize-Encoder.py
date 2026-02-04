@@ -3,14 +3,15 @@ import onnx
 from onnxruntime.transformers.float16 import convert_float_to_float16
 from onnxruntime.quantization import quantize_dynamic, QuantType
 from pathlib import Path
+from export_config import EXPORT_DIR
 
 # Configuration
 PROJECT_ROOT = Path(__file__).parent.absolute()
-MODEL_DIR = PROJECT_ROOT / "model" / "onnx"
+EXPORT_DIR = EXPORT_DIR / "onnx"
 
 FP32_MODELS = [
-    str(MODEL_DIR / "qwen3_asr_encoder_frontend.fp32.onnx"),
-    str(MODEL_DIR / "qwen3_asr_encoder_backend.fp32.onnx")
+    str(EXPORT_DIR / "qwen3_asr_encoder_frontend.fp32.onnx"),
+    str(EXPORT_DIR / "qwen3_asr_encoder_backend.fp32.onnx")
 ]
 
 def convert_to_fp16(input_path):
@@ -53,8 +54,8 @@ def convert_to_int8(input_path):
 def main():
     print("--- 正在开始针对 Qwen3-ASR Encoder 的批量量化/转换 ---")
     
-    if not MODEL_DIR.exists():
-        print(f"错误: 目录 {MODEL_DIR} 不存在。")
+    if not EXPORT_DIR.exists():
+        print(f"错误: 目录 {EXPORT_DIR} 不存在。")
         return
 
     for model_path in FP32_MODELS:
