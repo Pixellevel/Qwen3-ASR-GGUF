@@ -483,46 +483,39 @@ class Qwen3ASRAudioAttention(nn.Module):
         cu_seqlens: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         **kwargs,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
-        """Input shape: Batch x Time x Channel"""
+    ) -> torch.Tensor:
+        # 优化方案：回归标准 3D (B, T, D) 注意力逻辑，不再依赖扁平化
+        # 即使输入是扁平的 [N, D]，我们也可以把它当做 [1, N, D] 来处理
+        is_2d = hidden_states.dim() == 2
+        if is_2d:
+            hidden_states = hidden_states.unsqueeze(0)
+            
+        b, t, d = hidden_states.shape
+        
+        # 标准的 QKV 投影与转置 [B, H, T, K]
+        query_states = self.q_proj(hidden_states).unflatten(-1, (self.num_heads, self.head_dim)).transpose(1, 2)
+        key_states = self.k_proj(hidden_states).unflatten(-1, (self.num_heads, self.head_dim)).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).unflatten(-1, (self.num_heads, self.head_dim)).transpose(1, 2)
 
-        seq_length, _ = hidden_states.size()
-
-        # 优化技巧：避免使用 seq_length 显式生成形状
-        query_states = self.q_proj(hidden_states).unflatten(-1, (self.num_heads, self.head_dim))
-        key_states = self.k_proj(hidden_states).unflatten(-1, (self.num_heads, self.head_dim))
-        value_states = self.v_proj(hidden_states).unflatten(-1, (self.num_heads, self.head_dim))
-
-        query_states = query_states.transpose(0, 1).unsqueeze(0)
-        key_states = key_states.transpose(0, 1).unsqueeze(0)
-        value_states = value_states.transpose(0, 1).unsqueeze(0)
-        max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
-
-        attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
-            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
-
-        attn_output, _ = attention_interface(
-            self,
+        # 这里的 scaled_dot_product_attention 只要输入 [B, H, T, K] 就能被 ONNX 完美转换
+        # 我们这里不再传入 cu_seqlens，直接利用 T 轴
+        attn_output = F.scaled_dot_product_attention(
             query_states,
             key_states,
             value_states,
-            attention_mask=attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            cu_seq_lens_q=cu_seqlens,  # pass cu seq lens for FA2
-            cu_seq_lens_k=cu_seqlens,
-            max_length_q=max_seqlen,
-            max_length_k=max_seqlen,
+            attn_mask=attention_mask,
+            dropout_p=0.0 if not self.training else self.attention_dropout,
             is_causal=False,
-            **kwargs,
+            scale=self.scaling
         )
 
-        # attn_output shape is [1, num_heads, seq_length, head_dim] -> transpose(1,2) -> [1, seq_length, num_heads, head_dim]
-        # squeeze(0) and flatten(1) to get [seq_length, num_heads * head_dim]
-        attn_output = attn_output.squeeze(0).flatten(1).contiguous()
+        # 回归 [B, T, D]
+        attn_output = attn_output.transpose(1, 2).flatten(2).contiguous()
         attn_output = self.out_proj(attn_output)
 
+        if is_2d:
+            attn_output = attn_output.squeeze(0)
+            
         return attn_output
 
 

@@ -54,6 +54,29 @@ DirectML 报错 `node_view_2` 或 `Reshape` 失败，通常是因为 `view` 或 
 1.  将自定义目录添加到 `sys.path`。
 2.  在导出脚本中显式从自定义文件 `import Qwen3ASRForConditionalGeneration`，否则 `from_pretrained` 可能会去加载缓存中的原始代码，导致你的优化逻辑失效。
 
+## 7. ONNX 量化冲突定位 (896 vs 3584 报错)
+在对 Transformer 后端进行 INT8 量化时，常遇到 `Inferred shape (896) vs existing shape (3584)` 错误。
+*   **根源分析**：这是因为量化工具在处理复杂的**变长序列索引**（如 `cu_seqlens`）时，符号推断引擎“逻辑短路”，无法证明张量在经过 MLP 扩维后依然能与残差主干对齐，从而产生虚假约束冲突。
+*   **传统解法（有风险）**：使用 `onnxsim` 简化模型。它能修复元数据，但往往会将模型“固定化”，导致在推理变长音频时 DirectML 报错 `8007023E` (Reshape 尺寸不匹配)。
+
+## 8. 终极方案：3D 维度重构 (3D Dimension Reconstruction)
+为了既能通过量化校验，又能完美适配 DirectML 的动态性，应采用 **“Padding -> 3D 变换 -> Transformer -> 还原”** 的策略：
+
+1.  **Padding 对齐**：将输入序列 $T$ 填充到固定窗口大小（如 104）的倍数。
+2.  **升维处理**：利用 `unflatten` 把维度从 `[B, T, H]` 变成 `[B * Num_Chunks, Window_Size, H]` 的 **3D 结构**。
+3.  **静态窗口推理**：Transformer 每一层看到的输入长度固定（104），不再有任何符号计算，逻辑极其清晰。
+4.  **还原并切除**：推理结束后 `flatten` 回 2D，并切除末尾的 Padding 部分。
+
+*   **优势**：
+    *   **量化友好**：每一层维度在图上显式固定，推断引擎秒过。
+    *   **DML 友好**：算子图极其精简，无 `Range/Mod`，性能极佳 (RTF 可达 0.02)。
+    *   **精度稳定**：无需使用 `onnxsim` 即可在 CPU/GPU 上全通。
+
+## 9. onnxsim 与 DirectML 的兼容性陷阱
+*   **注意**：`onnxsim` 在简化模型时，可能会通过 `constant folding` 将某些动态 `Reshape` 节点坍缩为固定数字。
+*   **后果**：如果转录时长与导出时的 dummy 长度不一致，DirectML 会因为 Reshape 前后 Size 不等而崩溃。
+*   **对策**：对于 DML 场景，优先通过**代码重构**（如 3D 重构）来简化逻辑，而非依赖外部工具。如果必须用 `onnxsim`，请确保不要使用 `overwrite_input_shapes` 固定输入。
+
 ---
-*整理时间：2026-02-04*
+*整理时间：2026-02-04 (Update: 针对 3D 重构方案)*
 *整理者：Antigravity*

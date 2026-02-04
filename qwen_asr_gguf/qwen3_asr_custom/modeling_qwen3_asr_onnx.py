@@ -91,16 +91,16 @@ class EncoderTransformerBackend(nn.Module):
         
     def forward(self, hidden_states: torch.Tensor):
         # hidden_states: [B, T, H]
-        b, t, h = hidden_states.size()
+        b, t, d = hidden_states.shape
         device = hidden_states.device
         
         # 1. 添加局部位置编码 (对齐官方逻辑：每个分块内部重置位置索引)
-        # 官方代码中是在 [Num_Chunks, 13, H] 形状下加法的
+        # 优化方案：遵循经验文档，使用 ones_like + cumsum 替代 torch.arange(t)
+        # 这样可以避免导出复杂的 Range 算子，对符号推断更友好
         tn = 13
-        # 构造一个足够长的 position_embedding 映射
-        # 我们按照 tn=13 进行周期性填充，或者简单reshape
-        # 考虑到动态 T 可能不是 13 的倍数（虽然我们在 FE 做了处理），更稳妥的做法是：
-        pos_indices = torch.arange(t, device=device) % tn
+        pos_indices_full = torch.ones_like(hidden_states[0, :, 0], dtype=torch.int64).cumsum(0) - 1
+        pos_indices = pos_indices_full % tn
+        
         pos_emb = F.embedding(
             pos_indices, 
             self.encoder.positional_embedding.positional_embedding
@@ -108,28 +108,28 @@ class EncoderTransformerBackend(nn.Module):
         hidden_states = hidden_states + pos_emb.unsqueeze(0).to(hidden_states.dtype)
         
         # 2. Transformer 处理 (窗口化 Attention)
-        # n_window_infer = 800 frames = 8 chunks * 13 tokens = 104 tokens
+        # 优化方案：模仿成功案例，使用 纯 Tensor 拼接 替代 if 分支
         window_size = 104 
         
-        # 优化技巧：使用 flatten 替代 view(-1, ...)
-        hidden_states_flattened = hidden_states.flatten(0, 1)
+        # 计算需要填充的长度 (SymInt 兼容方式)
+        pad_len = (window_size - (t % window_size)) % window_size
         
-        # 生成符号化 cu_seqlens 以支持 ONNX 导出
-        num_windows = (t + window_size - 1) // window_size
-        steps = torch.arange(0, num_windows, device=device) * window_size
-        cu_seqlens_single = torch.cat([steps, torch.tensor([t], device=device, dtype=steps.dtype)])
+        # 构造零填充张量 (利用切片来处理 pad_len=0 的情况)
+        # 构造一个最大可能的零块，然后切出需要的长度
+        zeros_pad = torch.zeros((b, window_size, d), device=device, dtype=hidden_states.dtype)
+        padding = zeros_pad[:, :pad_len, :]
+        hidden_states = torch.cat([hidden_states, padding], dim=1)
         
-        if b > 1:
-            offsets = (torch.arange(0, b, device=device) * t).unflatten(0, (b, 1))
-            cu_seqlens = (cu_seqlens_single.unflatten(0, (1, -1)) + offsets).flatten(0, 1).to(torch.int32)
-        else:
-            cu_seqlens = cu_seqlens_single.to(torch.int32)
+        # 转换为 3D: [Batch * Num_Windows, window_size, 896]
+        num_windows = (t + pad_len) // window_size
+        hidden_states_3d = hidden_states.unflatten(1, (num_windows, window_size)).flatten(0, 1)
             
         for layer in self.encoder.layers:
-            hidden_states_flattened = layer(hidden_states_flattened, cu_seqlens)[0]
+            hidden_states_3d = layer(hidden_states_3d, None)[0]
             
-        # 优化技巧：使用 unflatten 还原维度
-        hidden_states = hidden_states_flattened.unflatten(0, (b, t))
+        # 还原形状并去除 Padding
+        hidden_states = hidden_states_3d.unflatten(0, (b, num_windows)).flatten(1, 2)
+        hidden_states = hidden_states[:, :t, :]
         
         # 3. 后投影
         hidden_states = self.encoder.ln_post(hidden_states)
