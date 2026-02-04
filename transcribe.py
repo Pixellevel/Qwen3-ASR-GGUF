@@ -29,8 +29,8 @@ providers = ['DmlExecutionProvider']
 # ==========================================
 # 配置参数 (根据您的路径环境修改)
 # ==========================================
-FRONTEND_ONNX_PATH = os.path.join(PROJECT_ROOT, "model", "onnx", "qwen3_asr_encoder_frontend.fp32.onnx")
-BACKEND_ONNX_PATH = os.path.join(PROJECT_ROOT, "model", "onnx", "qwen3_asr_encoder_backend.fp32.onnx")
+FRONTEND_ONNX_PATH = os.path.join(PROJECT_ROOT, "model", "onnx", "qwen3_asr_encoder_frontend.fp16.onnx")
+BACKEND_ONNX_PATH = os.path.join(PROJECT_ROOT, "model", "onnx", "qwen3_asr_encoder_backend.fp16.onnx")
 LLM_GGUF_PATH = os.path.join(PROJECT_ROOT, "model", "qwen3_asr_llm.q8_0.gguf")
 
 # Special Token IDs
@@ -46,7 +46,7 @@ class FastWhisperMel:
     def __init__(self, filter_path):
         self.filters = np.load(filter_path) # (201, 128)
         
-    def __call__(self, audio):
+    def __call__(self, audio, dtype=np.float32):
         # 1. STFT (Reflect padding, Hann window)
         stft = librosa.stft(audio, n_fft=400, hop_length=160, window='hann', center=True)
         # 2. Power Spectrum
@@ -59,7 +59,7 @@ class FastWhisperMel:
         log_spec = np.maximum(log_spec, np.max(log_spec) - 8.0)
         # 6. Scaling
         log_spec = (log_spec + 4.0) / 4.0
-        return log_spec.T.astype(np.float32) # (T, 128)
+        return log_spec.T.astype(dtype) # (T, 128)
 
 class Qwen3ASRTranscriber:
     def __init__(self):
@@ -91,8 +91,16 @@ class Qwen3ASRTranscriber:
         print(f"加载 Encoder Backend: {BACKEND_ONNX_PATH}")
         self.backend_sess = ort.InferenceSession(BACKEND_ONNX_PATH, sess_options=sess_options, providers=providers)
         
-        # 模型预热 (Warmup)
-        dummy_mel = np.random.randn(1, 200, 128).astype(np.float32)
+        # 检测模型输入类型 (Auto-detect FP32 vs FP16)
+        fe_input_type = self.frontend_sess.get_inputs()[0].type # 'tensor(float)' or 'tensor(float16)'
+        self.input_dtype = np.float16 if 'float16' in fe_input_type else np.float32
+        print(f"检测到 Encoder 输入精度: {self.input_dtype.__name__}")
+
+        # 模型预热 (Warmup: 使用 5 秒全零音频进行全流程预热)
+        warmup_seconds = 60
+        dummy_wav = np.zeros(int(16000 * warmup_seconds), dtype=np.float32)
+        dummy_mel = self.mel_extractor(dummy_wav, dtype=self.input_dtype)[np.newaxis, ...] # [1, T, 128]
+        
         dummy_feat = self.frontend_sess.run(None, {"mel": dummy_mel})[0]
         self.backend_sess.run(None, {"feat_in": dummy_feat})
         
@@ -123,7 +131,7 @@ class Qwen3ASRTranscriber:
         
         # 1. 提取 Mel 特征
         audio, _ = librosa.load(audio_path, sr=16000)
-        mel = self.mel_extractor(audio) # [T, 128]
+        mel = self.mel_extractor(audio, dtype=self.input_dtype) # [T, 128]
         mel = mel[np.newaxis, ...] # [1, T, 128]
             
         t_encoder_start = time.time()

@@ -36,8 +36,8 @@ ROLLBACK_VAR_COUNT = 5    # 回滚/撤销的 Token 数量 (不显示的延迟缓
 
 # 固定路径配置
 PROJECT_ROOT = Path(__file__).parent.absolute()
-FRONTEND_ONNX_PATH = os.path.join(PROJECT_ROOT, "model", "onnx", "qwen3_asr_encoder_frontend.fp32.onnx")
-BACKEND_ONNX_PATH = os.path.join(PROJECT_ROOT, "model", "onnx", "qwen3_asr_encoder_backend.fp32.onnx")
+FRONTEND_ONNX_PATH = os.path.join(PROJECT_ROOT, "model", "onnx", "qwen3_asr_encoder_frontend.fp16.onnx")
+BACKEND_ONNX_PATH = os.path.join(PROJECT_ROOT, "model", "onnx", "qwen3_asr_encoder_backend.fp16.onnx")
 LLM_GGUF_PATH = os.path.join(PROJECT_ROOT, "model", "qwen3_asr_llm.q8_0.gguf")
 
 # ==========================================
@@ -48,7 +48,7 @@ class FastWhisperMel:
     def __init__(self, filter_path):
         self.filters = np.load(filter_path) # (201, 128)
         
-    def __call__(self, audio):
+    def __call__(self, audio, dtype=np.float32):
         import librosa
         # 1. STFT (Reflect padding, Hann window)
         stft = librosa.stft(audio, n_fft=400, hop_length=160, window='hann', center=True)
@@ -61,7 +61,7 @@ class FastWhisperMel:
         # 5. Normalization
         log_spec = np.maximum(log_spec, log_spec.max() - 8.0)
         log_spec = (log_spec + 4.0) / 4.0
-        return log_spec
+        return log_spec.astype(dtype)
 
 def encoder_worker_proc(to_enc_q, from_enc_q):
     """独立进程运行的编码器：按需编码，瞬间启动"""
@@ -80,11 +80,16 @@ def encoder_worker_proc(to_enc_q, from_enc_q):
     
     mel_extractor = FastWhisperMel(MEL_FILTERS_PATH)
     
-    # GPU Warmup: 跑一段随机音频以触发 Shader 编译和显存分配
-    # 这将 1-2 秒的“冷启动”耗时提前到初始化阶段
-    dummy_wav = np.random.randn(int(16000 * 40)).astype(np.float32) # 2秒随机噪声
-    dummy_mel = mel_extractor(dummy_wav)
-    dummy_input = dummy_mel.T[np.newaxis, ...].astype(np.float32)
+    # 检测模型输入类型 (Auto-detect FP32 vs FP16)
+    fe_input_type = frontend_sess.get_inputs()[0].type # 'tensor(float)' or 'tensor(float16)'
+    input_dtype = np.float16 if 'float16' in fe_input_type else np.float32
+    print(f"Encoder Worker 检测到输入精度: {input_dtype.__name__}")
+
+    # GPU Warmup: 跑一段音频以触发 Shader 编译和显存分配
+    warmup_seconds = 40
+    dummy_wav = np.zeros(int(16000 * warmup_seconds), dtype=np.float32)
+    dummy_mel = mel_extractor(dummy_wav, dtype=input_dtype)
+    dummy_input = dummy_mel.T[np.newaxis, ...]
     feat_out = frontend_sess.run(None, {"mel": dummy_input})[0]
     _ = backend_sess.run(None, {"feat_in": feat_out})[0]
     
@@ -102,9 +107,9 @@ def encoder_worker_proc(to_enc_q, from_enc_q):
             audio_chunk = msg.data
             t0 = time.time()
             # 执行简易 Mel 提取
-            mel = mel_extractor(audio_chunk) # 返回 (128, T)
+            mel = mel_extractor(audio_chunk, dtype=input_dtype) # 返回 (128, T)
             # ONNX 前端需要 (Batch, Seq, 128)
-            mel_input = mel.T[np.newaxis, ...].astype(np.float32)
+            mel_input = mel.T[np.newaxis, ...]
             
             # 推理
             feat_out = frontend_sess.run(None, {"mel": mel_input})[0]
