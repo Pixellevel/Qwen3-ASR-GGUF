@@ -82,31 +82,5 @@ def export_frontend():
         print(f"❌ 导出前端模型 (FP32) 失败:")
         traceback.print_exc()
 
-    # 3. 导出 FP16 版本 (针对 GPU DML 优化)
-    print("\n[Exporting] Conv Frontend (FP16)...")
-    try:
-        # 将模型转为半精度
-        frontend_wrapper.half()
-        dummy_mel_half = dummy_mel_chunk.half()
-        
-        frontend_fp16_path = output_dir / "qwen3_asr_encoder_frontend.fp16.onnx"
-        
-        torch.onnx.export(
-            frontend_wrapper,
-            (dummy_mel_half,),
-            str(frontend_fp16_path),
-            input_names=["mel"],
-            output_names=["feat_out"],
-            dynamic_shapes=dynamic_shapes,
-            opset_version=18,
-            do_constant_folding=True,
-            dynamo=True,
-        )
-        print(f"✅ 卷积前端模型 (FP16) 已保存至: {frontend_fp16_path}")
-    except Exception:
-        import traceback
-        print(f"❌ 导出前端模型 (FP16) 失败:")
-        traceback.print_exc()
-
 if __name__ == "__main__":
     export_frontend()

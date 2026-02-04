@@ -16,11 +16,11 @@ if str(CUSTOM_MODEL_DIR) not in sys.path:
 from modeling_qwen3_asr_onnx import EncoderTransformerBackend
 from export_config import MODEL_DIR, EXPORT_DIR
 
-def export_backend_int8():
+def export_backend():
     """
-    导出 Qwen3-ASR Audio Encoder Transformer 后端并进行 INT8 量化。
+    导出 Qwen3-ASR Audio Encoder Transformer 后端为 FP32 ONNX。
     """
-    print(f"--- 正在准备导出 Audio Encoder Transformer 后端 (INT8 量化) ---")
+    print(f"--- 正在准备导出 Audio Encoder Transformer 后端 (FP32) ---")
     
     # 1. 加载模型
     print(f"正在加载原始模型权重: {MODEL_DIR}")
@@ -50,16 +50,14 @@ def export_backend_int8():
     output_dir = Path(EXPORT_DIR) / "onnx"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # 2. 导出 FP32 中间模型
-    print("\n[Stage 1/2] 导出 FP32 模型...")
+    # 2. 导出 FP32 模型
+    print("\n[Stage 1/1] 导出 FP32 模型...")
     backend_wrapper = EncoderTransformerBackend(encoder)
     backend_wrapper.eval()
     
     dummy_feat_in = torch.randn(1, 13, encoder.config.d_model)
     
     fp32_path = output_dir / "qwen3_asr_encoder_backend.fp32.onnx"
-    # 如果已经存在全量的 backend 模型，可以直接量化它。
-    # 但为了脚本独立性，我们这里先导出一个临时的。
     
     try:
         torch.onnx.export(
@@ -76,59 +74,11 @@ def export_backend_int8():
             do_constant_folding=True,
             dynamo=True,
         )
-        print(f"✅ FP32 模型已导出。")
+        print(f"✅ FP32 模型已导出计算至: {fp32_path}")
     except Exception:
         import traceback
         print(f"❌ 导出 FP32 模型失败:")
         traceback.print_exc()
-        return
-
-    # 3. 动态量化为 INT8
-    print("\n[Stage 2/3] 正在进行 INT8 动态量化 (针对 MatMul)...")
-    int8_path = output_dir / "qwen3_asr_encoder_backend.int8.onnx"
-    
-    try:
-        quantize_dynamic(
-            model_input=str(fp32_path),
-            model_output=str(int8_path),
-            op_types_to_quantize=["MatMul"],
-            per_channel=True,
-            reduce_range=False,
-            weight_type=QuantType.QUInt8
-        )
-        print(f"✅ INT8 量化模型已保存至: {int8_path}")
-    except Exception as e:
-        print(f"❌ 量化失败: {e}")
-
-    # 4. 导出 FP16 版本
-    print("\n[Stage 3/3] 导出 FP16 模型 (针对 GPU)...")
-    fp16_path = output_dir / "qwen3_asr_encoder_backend.fp16.onnx"
-    try:
-        # 重新加载 wrapper 或转换
-        backend_wrapper.float() # 回到 FP32
-        backend_wrapper.half()  # 转为 FP16
-        
-        dummy_feat_half = dummy_feat_in.half()
-        
-        torch.onnx.export(
-            backend_wrapper,
-            (dummy_feat_half,),
-            str(fp16_path),
-            input_names=["feat_in"],
-            output_names=["hidden_states"],
-            dynamic_axes={
-                "feat_in": {0: "batch", 1: "n_tokens"},
-                "hidden_states": {0: "batch", 1: "n_tokens"}
-            },
-            opset_version=18,
-            do_constant_folding=True,
-            dynamo=True
-        )
-        print(f"✅ Backend FP16 模型已保存至: {fp16_path}")
-    except Exception as e:
-        import traceback
-        print(f"❌ 导出 FP16 失败: {e}")
-        traceback.print_exc()
 
 if __name__ == "__main__":
-    export_backend_int8()
+    export_backend()
