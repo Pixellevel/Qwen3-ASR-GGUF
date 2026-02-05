@@ -119,7 +119,7 @@ class Qwen3ASRTranscriber:
 
         # 4. 创建 Context 和 Sampler
         self.ctx = llama.LlamaContext(self.model, n_ctx=4096, n_batch=4096, embeddings=False)
-        self.sampler = llama.LlamaSampler(temperature=0) 
+        self.sampler = llama.LlamaSampler(temperature=0.4) 
         
         self.t_load_duration = time.time() - t0
 
