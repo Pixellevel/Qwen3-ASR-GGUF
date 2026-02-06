@@ -185,40 +185,29 @@ def init_llama_lib():
         GGML_BASE_DLL = "libggml-base.so"
         LLAMA_DLL = "libllama.so"
 
-    original_cwd = os.getcwd()
-    os.chdir(lib_dir)
+    ggml = ctypes.CDLL(os.path.join(lib_dir, GGML_DLL))
+    ggml_base = ctypes.CDLL(os.path.join(lib_dir, GGML_BASE_DLL))
+    llama = ctypes.CDLL(os.path.join(lib_dir, LLAMA_DLL))
+
+    # 设置日志回调
+    LOG_CALLBACK = ctypes.CFUNCTYPE(None, ctypes.c_int, ctypes.c_char_p, ctypes.c_void_p)
+    llama_log_set = llama.llama_log_set
+    llama_log_set.argtypes = [LOG_CALLBACK, ctypes.c_void_p]
+    llama_log_set.restype = None
     
-    # Windows DLL directory treatment
-    if sys.platform == "win32" and hasattr(os, 'add_dll_directory'):
-        os.add_dll_directory(lib_dir)
+    # 默认开启日志路由
+    configure_logging(quiet=QUIET_LOGS)
 
-    try:
-        ggml = ctypes.CDLL(os.path.join(lib_dir, GGML_DLL))
-        ggml_base = ctypes.CDLL(os.path.join(lib_dir, GGML_BASE_DLL))
-        llama = ctypes.CDLL(os.path.join(lib_dir, LLAMA_DLL))
+    # 加载后端
+    ggml_backend_load_all = ggml.ggml_backend_load_all
+    ggml_backend_load_all.argtypes = []
+    ggml_backend_load_all.restype = None
+    ggml_backend_load_all()
 
-        # 设置日志回调
-        LOG_CALLBACK = ctypes.CFUNCTYPE(None, ctypes.c_int, ctypes.c_char_p, ctypes.c_void_p)
-        llama_log_set = llama.llama_log_set
-        llama_log_set.argtypes = [LOG_CALLBACK, ctypes.c_void_p]
-        llama_log_set.restype = None
-        
-        # 默认开启日志路由
-        configure_logging(quiet=QUIET_LOGS)
-
-        # 加载后端
-        ggml_backend_load_all = ggml.ggml_backend_load_all
-        ggml_backend_load_all.argtypes = []
-        ggml_backend_load_all.restype = None
-        ggml_backend_load_all()
-
-        llama_backend_init = llama.llama_backend_init
-        llama_backend_init.argtypes = []
-        llama_backend_init.restype = None
-        llama_backend_init()
-
-    finally:
-        os.chdir(original_cwd)
+    llama_backend_init = llama.llama_backend_init
+    llama_backend_init.argtypes = []
+    llama_backend_init.restype = None
+    llama_backend_init()
 
     # 绑定其他函数
     llama_backend_free = llama.llama_backend_free
@@ -313,89 +302,91 @@ def init_llama_lib():
     llama_memory_clear.restype = None
 
     # Sampler
-    try:
-        llama_sampler_chain_default_params = llama.llama_sampler_chain_default_params
-        llama_sampler_chain_default_params.argtypes = []
-        llama_sampler_chain_default_params.restype = llama_sampler_chain_params
+    llama_sampler_chain_default_params = llama.llama_sampler_chain_default_params
+    llama_sampler_chain_default_params.argtypes = []
+    llama_sampler_chain_default_params.restype = llama_sampler_chain_params
 
-        llama_sampler_chain_init = llama.llama_sampler_chain_init
-        llama_sampler_chain_init.argtypes = [llama_sampler_chain_params]
-        llama_sampler_chain_init.restype = ctypes.c_void_p
+    llama_sampler_chain_init = llama.llama_sampler_chain_init
+    llama_sampler_chain_init.argtypes = [llama_sampler_chain_params]
+    llama_sampler_chain_init.restype = ctypes.c_void_p
 
-        llama_sampler_chain_add = llama.llama_sampler_chain_add
-        llama_sampler_chain_add.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-        llama_sampler_chain_add.restype = None
+    llama_sampler_chain_add = llama.llama_sampler_chain_add
+    llama_sampler_chain_add.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    llama_sampler_chain_add.restype = None
 
-        llama_sampler_init_greedy = llama.llama_sampler_init_greedy
-        llama_sampler_init_greedy.argtypes = []
-        llama_sampler_init_greedy.restype = ctypes.c_void_p
+    llama_sampler_init_greedy = llama.llama_sampler_init_greedy
+    llama_sampler_init_greedy.argtypes = []
+    llama_sampler_init_greedy.restype = ctypes.c_void_p
 
-        llama_sampler_init_dist = llama.llama_sampler_init_dist
-        llama_sampler_init_dist.argtypes = [ctypes.c_uint32]
-        llama_sampler_init_dist.restype = ctypes.c_void_p
+    llama_sampler_init_dist = llama.llama_sampler_init_dist
+    llama_sampler_init_dist.argtypes = [ctypes.c_uint32]
+    llama_sampler_init_dist.restype = ctypes.c_void_p
 
-        llama_sampler_init_temp = llama.llama_sampler_init_temp
-        llama_sampler_init_temp.argtypes = [ctypes.c_float]
-        llama_sampler_init_temp.restype = ctypes.c_void_p
+    llama_sampler_init_temp = llama.llama_sampler_init_temp
+    llama_sampler_init_temp.argtypes = [ctypes.c_float]
+    llama_sampler_init_temp.restype = ctypes.c_void_p
 
-        llama_sampler_init_top_k = llama.llama_sampler_init_top_k
-        llama_sampler_init_top_k.argtypes = [ctypes.c_int32]
-        llama_sampler_init_top_k.restype = ctypes.c_void_p
+    llama_sampler_init_top_k = llama.llama_sampler_init_top_k
+    llama_sampler_init_top_k.argtypes = [ctypes.c_int32]
+    llama_sampler_init_top_k.restype = ctypes.c_void_p
 
-        llama_sampler_init_top_p = llama.llama_sampler_init_top_p
-        llama_sampler_init_top_p.argtypes = [ctypes.c_float, ctypes.c_size_t]
-        llama_sampler_init_top_p.restype = ctypes.c_void_p
+    llama_sampler_init_top_p = llama.llama_sampler_init_top_p
+    llama_sampler_init_top_p.argtypes = [ctypes.c_float, ctypes.c_size_t]
+    llama_sampler_init_top_p.restype = ctypes.c_void_p
 
-        llama_sampler_sample = llama.llama_sampler_sample
-        llama_sampler_sample.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int32]
-        llama_sampler_sample.restype = llama_token
+    llama_sampler_sample = llama.llama_sampler_sample
+    llama_sampler_sample.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int32]
+    llama_sampler_sample.restype = llama_token
 
-        llama_sampler_free = llama.llama_sampler_free
-        llama_sampler_free.argtypes = [ctypes.c_void_p]
-        llama_sampler_free.restype = None
+    llama_sampler_free = llama.llama_sampler_free
+    llama_sampler_free.argtypes = [ctypes.c_void_p]
+    llama_sampler_free.restype = None
 
-        llama_sampler_init_logit_bias = llama.llama_sampler_init_logit_bias
-        llama_sampler_init_logit_bias.argtypes = [ctypes.c_int32, ctypes.c_int32, ctypes.POINTER(llama_logit_bias)]
-        llama_sampler_init_logit_bias.restype = ctypes.c_void_p
-    except AttributeError:
-        # 版本较旧的 llama.cpp 可能没有这些导出
-        logger.warning("llama.cpp 库中缺少原生采样 API，将无法使用原生采样优化。")
+    llama_sampler_init_logit_bias = llama.llama_sampler_init_logit_bias
+    llama_sampler_init_logit_bias.argtypes = [ctypes.c_int32, ctypes.c_int32, ctypes.POINTER(llama_logit_bias)]
+    llama_sampler_init_logit_bias.restype = ctypes.c_void_p
 
-def load_model(model_path: str, n_gpu_layers: int = -1):
-    """加载 GGUF 模型（包含环境优化和错误排查日志）"""
-    init_llama_lib()
+
+def load_model(model_path: str):
+    """
+    加载 GGUF 模型（自动处理初始化和路径编码）
     
-    lib_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bin")
-    model_path_obj = Path(model_path).resolve()
-    
-    # 计算相对于 bin 的路径，有些情况下 dll 寻找模型用相对路径更稳
-    try:
-        model_rel = relpath(model_path_obj, lib_dir)
-    except ValueError:
-        model_rel = model_path_obj.as_posix()
-
-    model_params = llama_model_default_params()
-    if n_gpu_layers != -1:
-        model_params.n_gpu_layers = n_gpu_layers
-
-    # 如果在 Windows 上，临时切目录以确保模型加载器能找到一些奇怪的路径
-    original_cwd = os.getcwd()
-    os.chdir(lib_dir)
-    try:
-        model = llama_model_load_from_file(
-            model_rel.encode('utf-8'),
-            model_params
-        )
-    finally:
-        os.chdir(original_cwd)
-
-    if not model:
-        logger.error(f"模型加载失败: {model_path_obj}")
-        logger.error(f"当前工作目录: {original_cwd}")
-        logger.error(f"模型是否存在: {model_path_obj.exists()}")
-        return None
+    Args:
+        model_path: GGUF 模型文件路径
         
-    return model
+    Returns:
+        model: llama_model 指针
+    """
+    lib_dir = Path(__file__).parent / 'bin'
+    model_path = Path(model_path).resolve()
+    model_rel = Path(relpath(model_path, lib_dir))
+
+    # 跳转到 dll 所在目录，并将其加到 Path
+    original_cwd = Path.cwd()
+    os.chdir(lib_dir)
+    if hasattr(os, 'add_dll_directory'):
+        os.add_dll_directory(os.getcwd())
+    os.environ['PATH'] = os.getcwd() + os.pathsep + os.environ['PATH']
+    logger.info(f"Changed directory to: {Path.cwd()}")
+
+    # 初始化 backend，载入模型
+    init_llama_lib()
+    model_params = llama_model_default_params()
+    model = llama_model_load_from_file(
+        model_rel.as_posix().encode('utf-8'),
+        model_params
+    )
+
+    if model:
+        os.chdir(original_cwd)
+        logger.info(f"Restored directory to: {Path.cwd()}")
+        return model
+    else:
+        logger.error(f'当前路径：{Path.cwd()}')
+        logger.error(f'模型绝对路径：{model_path.as_posix()}')
+        logger.error(f'模型可访问性：{model_path.exists()}')
+        logger.error(f"模型加载失败: {model_path}")
+        return None
 
 def create_context(model, n_ctx=2048, n_batch=2048, n_ubatch=512, n_seq_max=1, 
                    embeddings=False, pooling_type=0, flash_attn=True, 
@@ -424,28 +415,7 @@ def create_context(model, n_ctx=2048, n_batch=2048, n_ubatch=512, n_seq_max=1,
 class LlamaModel:
     """模型的面向对象封装"""
     def __init__(self, path, n_gpu_layers=-1):
-        init_llama_lib()
-        self.path = path
-        self.params = llama_model_default_params()
-        if n_gpu_layers != -1:
-            self.params.n_gpu_layers = n_gpu_layers
-        
-        lib_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bin")
-        model_path_obj = Path(path).resolve()
-        try:
-            model_rel = relpath(model_path_obj, lib_dir)
-        except ValueError:
-            model_rel = model_path_obj.as_posix()
-
-        original_cwd = os.getcwd()
-        os.chdir(lib_dir)
-        try:
-            self.ptr = llama_model_load_from_file(model_rel.encode('utf-8'), self.params)
-        finally:
-            os.chdir(original_cwd)
-
-        if not self.ptr:
-            raise RuntimeError(f"模型加载失败: {path}")
+        self.ptr = load_model(path)
             
         self.vocab = llama_model_get_vocab(self.ptr)
         self.n_embd = llama_model_n_embd(self.ptr)
