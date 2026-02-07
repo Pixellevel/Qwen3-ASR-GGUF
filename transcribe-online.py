@@ -4,11 +4,20 @@ import sys
 import time
 import codecs
 import numpy as np
+import multiprocessing as mp
 from pathlib import Path
 from collections import deque
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Any, Optional
+from qwen_asr_gguf import chinese_itn
+
+# ==================== Vulkan 选项 ====================
+
+# os.environ["VK_ICD_FILENAMES"] = "none"       # 禁止 Vulkan
+# os.environ["GGML_VK_VISIBLE_DEVICES"] = "1"   # 禁止 Vulkan 用独显（强制用集显）
+# os.environ["GGML_VK_DISABLE_F16"] = "1"       # 禁止 VulkanFP16 计算（Intel集显fp16有溢出问题）
+
 
 # ==========================================
 # 1. 协议定义 (Dataclasses)
@@ -26,19 +35,6 @@ class StreamingMessage:
     data: Any = None      # 存放音频 chunk 或 embedding 结果
     is_last: bool = False # 标记是否为最后一段音频
     encode_time: float = 0.0 # 编码器实际耗时
-
-# ==========================================
-# 核心配置参数 (User Control)
-# ==========================================
-CHUNK_DURATION = 40.0     # 音频切片时长 (秒)
-MEMORY_VAR_COUNT = 2      # 记忆中保留的音频片段数量
-ROLLBACK_VAR_COUNT = 5    # 回滚/撤销的 Token 数量 (不显示的延迟缓冲区大小)
-
-# 固定路径配置
-PROJECT_ROOT = Path(__file__).parent.absolute()
-FRONTEND_ONNX_PATH = os.path.join(PROJECT_ROOT, "model", "onnx", "qwen3_asr_encoder_frontend.fp16.onnx")
-BACKEND_ONNX_PATH = os.path.join(PROJECT_ROOT, "model", "onnx", "qwen3_asr_encoder_backend.fp16.onnx")
-LLM_GGUF_PATH = os.path.join(PROJECT_ROOT, "model", "qwen3_asr_llm.q8_0.gguf")
 
 # ==========================================
 # 2. 编码器进程 (Encoder Worker & Preprocessor)
@@ -63,35 +59,50 @@ class FastWhisperMel:
         log_spec = (log_spec + 4.0) / 4.0
         return log_spec.astype(dtype)
 
-def encoder_worker_proc(to_enc_q, from_enc_q):
+def encoder_worker_proc(to_enc_q, from_enc_q, frontend_path, backend_path, mel_filters_path):
     """独立进程运行的编码器：按需编码，瞬间启动"""
     import onnxruntime as ort
     
-    # 路径定义
-    MEL_FILTERS_PATH = os.path.join(PROJECT_ROOT, "model", "mel_filters.npy")
-    
     # 初始化
-    providers = ['DmlExecutionProvider', 'CPUExecutionProvider']
     sess_opts = ort.SessionOptions()
     sess_opts.log_severity_level = 3
+    sess_opts.add_session_config_entry("session.intra_op.allow_spinning", "0")
+    sess_opts.add_session_config_entry("session.inter_op.allow_spinning", "0")
+    sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+
+    providers = ['CPUExecutionProvider']
+    # if 'DmlExecutionProvider' in ort.get_available_providers():
+    #     providers.insert(0, 'DmlExecutionProvider') 
+
+    try:
+        frontend_sess = ort.InferenceSession(frontend_path, sess_options=sess_opts, providers=providers)
+        backend_sess = ort.InferenceSession(backend_path, sess_options=sess_opts, providers=providers)
+    except Exception as e:
+        print(f"[编码进程] 加载 ONNX 模型失败: {e}")
+        # 发送错误信号或直接退出
+        return
     
-    frontend_sess = ort.InferenceSession(FRONTEND_ONNX_PATH, sess_options=sess_opts, providers=providers)
-    backend_sess = ort.InferenceSession(BACKEND_ONNX_PATH, sess_options=sess_opts, providers=providers)
-    
-    mel_extractor = FastWhisperMel(MEL_FILTERS_PATH)
+    mel_extractor = FastWhisperMel(mel_filters_path)
     
     # 检测模型输入类型 (Auto-detect FP32 vs FP16)
-    fe_input_type = frontend_sess.get_inputs()[0].type # 'tensor(float)' or 'tensor(float16)'
-    input_dtype = np.float16 if 'float16' in fe_input_type else np.float32
-    print(f"Encoder Worker 检测到输入精度: {input_dtype.__name__}")
+    try:
+        fe_input_type = frontend_sess.get_inputs()[0].type # 'tensor(float)' or 'tensor(float16)'
+        input_dtype = np.float16 if 'float16' in fe_input_type else np.float32
+        # print(f"编码进程检测到输入精度: {input_dtype.__name__}")
+    except:
+        input_dtype = np.float32
+        print(f"编码进程默认输入精度: float32")
 
     # GPU Warmup: 跑一段音频以触发 Shader 编译和显存分配
     warmup_seconds = 40
     dummy_wav = np.zeros(int(16000 * warmup_seconds), dtype=np.float32)
-    dummy_mel = mel_extractor(dummy_wav, dtype=input_dtype)
-    dummy_input = dummy_mel.T[np.newaxis, ...]
-    feat_out = frontend_sess.run(None, {"mel": dummy_input})[0]
-    _ = backend_sess.run(None, {"feat_in": feat_out})[0]
+    try:
+        dummy_mel = mel_extractor(dummy_wav, dtype=input_dtype)
+        dummy_input = dummy_mel.T[np.newaxis, ...]
+        feat_out = frontend_sess.run(None, {"mel": dummy_input})[0]
+        _ = backend_sess.run(None, {"feat_in": feat_out})[0]
+    except Exception as e:
+        print(f"[编码进程] 预热失败 (已忽略): {e}")
     
     # 发送就绪信号
     from_enc_q.put(StreamingMessage(MsgType.MSG_READY))
@@ -120,84 +131,108 @@ def encoder_worker_proc(to_enc_q, from_enc_q):
             from_enc_q.put(StreamingMessage(MsgType.MSG_EMBD, data=audio_embd, is_last=msg.is_last, encode_time=t_encode))
 
 # ==========================================
-# 3. 核心流式器 (Master)
+# 3. 辅助函数: Pydub 音频加载
+# ==========================================
+def load_audio(audio_path, sample_rate=16000, start_second=None, duration=None):
+    """加载音频文件并转换为 16kHz PCM，支持按需加载指定片段"""
+    from pydub import AudioSegment
+    
+    # 使用 pydub 的 start_second 和 duration 参数来减少解码量（如果环境支持）
+    # 如果环境中的 pydub 不支持这些参数，它们会被忽略或报错，这里通过 kwargs 传递更稳健
+    load_kwargs = {
+        "frame_rate": sample_rate, 
+        "channels": 1
+    }
+    if start_second is not None: load_kwargs['start_second'] = start_second
+    if duration: load_kwargs['duration'] = duration
+
+    audio_segment = AudioSegment.from_file(audio_path, **load_kwargs)
+
+    bit_depth = audio_segment.sample_width * 8
+    max_val = float(1 << (bit_depth - 1))
+    
+    audio = np.array(
+        audio_segment
+        .set_channels(1)
+        .set_frame_rate(sample_rate)
+        .get_array_of_samples(),
+    ) / max_val
+
+    return audio
+
+# ==========================================
+# 4. 核心流式器 (Engine)
 # ==========================================
 class ChunkSegment:
     def __init__(self, audio_embd):
         self.audio_embd = audio_embd
         self.committed_text = "" # 该片段锁定的稳定文本
 
-class InfiniteStreamer31:
-    def __init__(self, context=""):
-        import multiprocessing as mp
-        # from tokenizers import Tokenizer
+class QwenASREngine:
+    def __init__(
+        self,
+        encoder_frontend_path: str,
+        encoder_backend_path: str,
+        llm_gguf_path: str,
+        mel_filters_path: str,
+        verbose: bool = True
+    ):
         t_start = time.time()
-        print(f"--- 初始化 Infinite Streaming Engine (Bidirectional Handshake & Native GGUF) ---")
-        
-        self.context = context
-        # TOKENIZER_PATH = os.path.join(PROJECT_ROOT, "model", "tokenizer.json")
-        # self.tokenizer = Tokenizer.from_file(TOKENIZER_PATH)
+        print(f"--- 初始化 QwenASR 引擎 ---")
+        self.verbose = verbose
         
         # 延迟导入 LLM 组件
         from qwen_asr_gguf import llama
-        self.model = llama.LlamaModel(LLM_GGUF_PATH)
-        self.embedding_table = llama.get_token_embeddings_gguf(LLM_GGUF_PATH)
+        self.llama_mod = llama # keep reference
+        
+        # 加载 LLM
+        if verbose: print(f"正在加载 LLM: {llm_gguf_path}")
+        self.model = llama.LlamaModel(llm_gguf_path)
+        self.embedding_table = llama.get_token_embeddings_gguf(llm_gguf_path)
         self.ctx = llama.LlamaContext(self.model, n_ctx=4096, n_batch=4096, embeddings=False)
-        self.sampler = llama.LlamaSampler(temperature=0.4)
         
         # 建立消息队列
         self.to_enc_q = mp.Queue()
         self.from_enc_q = mp.Queue()
         
         # 启动编码器进程
-        self.enc_proc = mp.Process(target=encoder_worker_proc, args=(self.to_enc_q, self.from_enc_q), daemon=True)
+        if verbose: print("正在启动音频编码进程...")
+        self.enc_proc = mp.Process(
+            target=encoder_worker_proc, 
+            args=(self.to_enc_q, self.from_enc_q, encoder_frontend_path, encoder_backend_path, mel_filters_path), 
+            daemon=True
+        )
         self.enc_proc.start()
         
         # 等待就绪
         msg = self.from_enc_q.get()
         if msg.msg_type == MsgType.MSG_READY:
-            print("Encoder Worker Ready.")
-
-        # 状态管理
-        self.segment_queue = deque(maxlen=MEMORY_VAR_COUNT)
-        self.archive_text = ""
+            if verbose: print("音频编码进程就绪。")
         
-        # 统计数据
-        self.total_prefill_time = 0.0
-        self.total_decode_time = 0.0
-        self.total_prefill_tokens = 0
-        self.total_decode_tokens = 0
-        self.total_encode_time = 0.0
-        self.total_wait_time = 0.0
         self.load_time = time.time() - t_start
         
-        # 基础 Token ID (Native Lookup)
+        # 基础 Token ID缓存
         self.ID_IM_START = self.model.token_to_id("<|im_start|>")
         self.ID_IM_END = self.model.token_to_id("<|im_end|>")
         self.ID_AUDIO_START = self.model.token_to_id("<|audio_start|>")
         self.ID_AUDIO_END = self.model.token_to_id("<|audio_end|>")
         self.ID_ASR_TEXT = self.model.token_to_id("<asr_text>")
 
-    def decode_tokens(self, tokens):
-        if not tokens: return ""
-        # 统一使用 native detokenize
-        return self.model.detokenize(tokens)
-
     def shutdown(self):
         self.to_enc_q.put(StreamingMessage(MsgType.CMD_STOP))
         msg = self.from_enc_q.get()
         if msg.msg_type == MsgType.MSG_DONE:
-            print("\n\nEncoder Worker Terminated Safely.")
+            if self.verbose: print("\n编码进程已安全终止。")
         self.enc_proc.join()
 
-    def run_llm_buffered(self, audio_embd, prefix_text, is_last_chunk=False, language: str = None):
+    def _run_llm_buffered(self, audio_embd, prefix_text, context, sampler, 
+                         rollback_num, is_last_chunk=False, language=None):
+        """内部方法：执行具体的 LLM 生成逻辑"""
         import numpy as np
-        import codecs
-        from qwen_asr_gguf import llama
         
         # 1. Prompt Construction
         system_text = "You are a helpful assistant. "
-        user_prompt_text = f"{self.context}\n\n" if self.context else ""
+        user_prompt_text = f"{context}\n\n" if context else ""
 
         def tk(t): return self.model.tokenize(t)
 
@@ -225,28 +260,27 @@ class InfiniteStreamer31:
         
         pos_base = np.arange(0, total_len, dtype=np.int32)
         pos_arr = np.concatenate([pos_base, pos_base, pos_base, np.zeros(total_len, dtype=np.int32)])
-        batch = llama.LlamaBatch(max(total_len * 4, 8192), self.model.n_embd, 1)
+        batch = self.llama_mod.LlamaBatch(max(total_len * 4, 8192), self.model.n_embd, 1)
         batch.set_embd(full_embd, pos=pos_arr)
         
         self.ctx.clear_kv_cache()
         t_pre_start = time.time()
         self.ctx.decode(batch)
-        self.total_prefill_time += (time.time() - t_pre_start)
-        self.total_prefill_tokens += total_len
+        prefill_time = time.time() - t_pre_start
         
-        # 2. Generation Loop with Async Overlap
+        # 2. Generation Loop
         t_gen_start = time.time()
         n_gen_tokens = 0
         display_queue = deque()
         stable_tokens = []
         stable_text_acc = ""
         cur_pos = total_len
-        gen_batch = llama.LlamaBatch(4, 0, 1)
+        gen_batch = self.llama_mod.LlamaBatch(4, 0, 1)
         decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
         
-        last_sampled_token = self.sampler.sample(self.ctx.ptr)
+        last_sampled_token = sampler.sample(self.ctx.ptr)
         
-        for _ in range(150):
+        for _ in range(150): # Max new tokens per chunk
             if last_sampled_token in [self.model.eos_token, self.ID_IM_END]:
                 break
             
@@ -255,21 +289,21 @@ class InfiniteStreamer31:
             
             # --- OVERLAP GAP: CPU Word ---
             display_queue.append(last_sampled_token)
-            if len(display_queue) > ROLLBACK_VAR_COUNT:
+            if len(display_queue) > rollback_num:
                 ready_token = display_queue.popleft()
                 stable_tokens.append(ready_token)
                 piece = decoder.decode(self.model.token_to_bytes(ready_token))
                 if piece:
+                    # 实时打印稳定文本 (如果不需要实时打印，可以注释掉)
                     print(piece, end="", flush=True)
                     stable_text_acc += piece
             # ------------------------------
             
             cur_pos += 1
-            last_sampled_token = self.sampler.sample(self.ctx.ptr)
+            last_sampled_token = sampler.sample(self.ctx.ptr)
             n_gen_tokens += 1
             
-        self.total_decode_time += (time.time() - t_gen_start)
-        self.total_decode_tokens += n_gen_tokens
+        gen_time = time.time() - t_gen_start
             
         if is_last_chunk:
             while display_queue:
@@ -284,90 +318,171 @@ class InfiniteStreamer31:
                 print(final_p, end="", flush=True)
                 stable_text_acc += final_p
             
-        return prefix_text + stable_text_acc, stable_tokens
+        return prefix_text + stable_text_acc, stable_tokens, prefill_time, gen_time, total_len, n_gen_tokens
+
+    def transcribe(
+        self, 
+        audio_file: str, 
+        language: str = None, 
+        context: str = None, 
+        chunk_size: float = 40.0,
+        start_second: float = 0.0,
+        duration: float = None,
+        temperature: float = 0.4,
+        memory_num: int = 2,    # 记忆中保留的音频片段数量
+        rollback_num: int = 5   # 回滚/撤销的 Token 数量
+    ) -> str:
+        
+        if self.verbose:
+            print(f"\n正在处理: {audio_file}")
+            print(f"参数配置: 切片={chunk_size}s, 记忆数={memory_num}, 温度={temperature}, 语言={language}, 起始={start_second}s, 时长={duration}s")
+
+        # 重新创建 Sampler (以支持动态 Temperature)
+        sampler = self.llama_mod.LlamaSampler(temperature=temperature)
+
+        # 加载音频 (使用 Pydub)
+        full_audio = load_audio(audio_file, sample_rate=16000, start_second=start_second, duration=duration)
+        sr = 16000
+
+        SAMPLES_PER_CHUNK = int(chunk_size * sr)
+        total_len = len(full_audio)
+        num_chunks = int(np.ceil(total_len / SAMPLES_PER_CHUNK))
+        
+        # 状态重置
+        segment_queue = deque(maxlen=memory_num)
+        archive_text = ""
+        total_full_text = ""
+        
+        # 统计
+        stats = {
+            "prefill_time": 0.0, "decode_time": 0.0,
+            "prefill_tokens": 0, "decode_tokens": 0,
+            "wait_time": 0.0, "encode_time": 0.0
+        }
+        
+        t_main_start = time.time()
+        
+        # --- 内部 Chunk 获取函数 ---
+        def get_chunk(idx):
+            s = idx * SAMPLES_PER_CHUNK
+            e = min((idx+1) * SAMPLES_PER_CHUNK, total_len)
+            chunk = full_audio[s:e]
+            if len(chunk) < SAMPLES_PER_CHUNK:
+                chunk = np.pad(chunk, (0, SAMPLES_PER_CHUNK - len(chunk)))
+            return chunk, (idx == num_chunks - 1)
+
+        print("--- 开始流式转录 ---")
+        
+        # 1. 发送第一个块
+        if num_chunks > 0:
+            chunk, is_last = get_chunk(0)
+            self.to_enc_q.put(StreamingMessage(MsgType.CMD_ENCODE, data=chunk, is_last=is_last))
+        
+        for i in range(num_chunks):
+            # 2. 等待当前块的 Embedding
+            t_w_start = time.time()
+            msg: StreamingMessage = self.from_enc_q.get()
+            stats["wait_time"] += (time.time() - t_w_start)
+            stats["encode_time"] += msg.encode_time
+            
+            current_embd = msg.data
+            was_last = msg.is_last
+            
+            # 3. 握手触发：立刻发送下一块的编码指令（如果有）
+            if not was_last:
+                next_chunk, next_is_last = get_chunk(i + 1)
+                self.to_enc_q.put(StreamingMessage(MsgType.CMD_ENCODE, data=next_chunk, is_last=next_is_last))
+            
+            # 4. LLM 解码
+            new_seg = ChunkSegment(current_embd)
+            if len(segment_queue) >= memory_num:
+                oldest = segment_queue.popleft()
+                archive_text += oldest.committed_text
+            segment_queue.append(new_seg)
+            
+            prefix_str = archive_text + "".join([s.committed_text for s in list(segment_queue)[:-1]])
+            total_audio_input = np.concatenate([s.audio_embd for s in segment_queue], axis=0)
+            
+            full_out_text, _, t_pre, t_gen, n_pre, n_gen = self._run_llm_buffered(
+                total_audio_input, prefix_str, context, sampler, rollback_num, 
+                is_last_chunk=was_last, language=language
+            )
+            
+            # 更新 Segment 产生的文本 (减去 Prefix)
+            new_text_part = full_out_text[len(prefix_str):]
+            new_seg.committed_text = new_text_part
+            total_full_text = full_out_text
+            
+            stats["prefill_time"] += t_pre
+            stats["decode_time"] += t_gen
+            stats["prefill_tokens"] += n_pre
+            stats["decode_tokens"] += n_gen
+
+        t_total = time.time() - t_main_start
+        audio_duration = total_len / 16000
+        
+        print('\n\n')
+        print('='*10 + 'ITN处理结果' + '='*10)
+        total_full_text = chinese_itn.chinese_to_num(total_full_text)
+        print(total_full_text)
+        print('='*30)
+        
+        if self.verbose:
+            rtf = t_total / audio_duration if audio_duration > 0 else 0
+            prefill_speed = stats["prefill_tokens"] / stats["prefill_time"] if stats["prefill_time"] > 0 else 0
+            decode_speed = stats["decode_tokens"] / stats["decode_time"] if stats["decode_time"] > 0 else 0
+            
+            print(f"\n\n📊 性能统计:")
+            print(f"  🔹 RTF (实时率) : {rtf:.3f} (越小越快)")
+            print(f"  🔹 音频时长    : {audio_duration:.2f} 秒")
+            print(f"  🔹 总处理耗时  : {t_total:.2f} 秒")
+            print(f"  🔹 编码等待    : {stats['wait_time']:.2f} 秒 (等待音频特征提取)")
+            print(f"  🔹 LLM 预填充  : {stats['prefill_time']:.3f} 秒 ({stats['prefill_tokens']} tokens, {prefill_speed:.1f} tokens/s)")
+            print(f"  🔹 LLM 生成    : {stats['decode_time']:.3f} 秒 ({stats['decode_tokens']} tokens, {decode_speed:.1f} tokens/s)")
+            
+        return total_full_text
 
 # ==========================================
-# 4. 主程序 (Runner)
+# 5. 主程序 (Example Usage)
 # ==========================================
-def main():
-    import numpy as np
-    import librosa
-    
-    AUDIO_FILE = "test.mp3"
-    CONTEXT = "这是1004期睡前消息，主持人叫督工，助理叫静静，"
-    
-    streamer = InfiniteStreamer31(context=CONTEXT)
-    
-    print(f"Loading audio: {AUDIO_FILE}")
-    full_audio, sr = librosa.load(AUDIO_FILE, sr=16000)
-    SAMPLES_PER_CHUNK = int(CHUNK_DURATION * sr)
-    total_len = len(full_audio)
-    num_chunks = int(np.ceil(total_len / SAMPLES_PER_CHUNK))
-    
-    print("--- Start Pipelined Streaming ---")
-    t_main_start = time.time()
-    
-    # --- 启动第一个分块的编码 ---
-    def get_chunk(idx):
-        s = idx * SAMPLES_PER_CHUNK
-        e = min((idx+1) * SAMPLES_PER_CHUNK, total_len)
-        chunk = full_audio[s:e]
-        if len(chunk) < SAMPLES_PER_CHUNK:
-            chunk = np.pad(chunk, (0, SAMPLES_PER_CHUNK - len(chunk)))
-        return chunk, (idx == num_chunks - 1)
-
-    # 1. 发送第一个块
-    chunk, is_last = get_chunk(0)
-    streamer.to_enc_q.put(StreamingMessage(MsgType.CMD_ENCODE, data=chunk, is_last=is_last))
-    
-    for i in range(num_chunks):
-        # 2. 等待当前块的 Embedding
-        t_w_start = time.time()
-        msg: StreamingMessage = streamer.from_enc_q.get()
-        streamer.total_wait_time += (time.time() - t_w_start)
-        streamer.total_encode_time += msg.encode_time
-        
-        current_embd = msg.data
-        was_last = msg.is_last
-        
-        # 3. 握手触发：立刻发送下一块的编码指令（如果有）
-        if not was_last:
-            next_chunk, next_is_last = get_chunk(i + 1)
-            streamer.to_enc_q.put(StreamingMessage(MsgType.CMD_ENCODE, data=next_chunk, is_last=next_is_last))
-        
-        # 4. 同时进行本块的 LLM 解码 (此时编码器正在后台算下一块)
-        # 管理滑动窗口
-        new_seg = ChunkSegment(current_embd)
-        if len(streamer.segment_queue) >= MEMORY_VAR_COUNT:
-            oldest = streamer.segment_queue.popleft()
-            streamer.archive_text += oldest.committed_text
-        streamer.segment_queue.append(new_seg)
-        
-        prefix_str = streamer.archive_text + "".join([s.committed_text for s in list(streamer.segment_queue)[:-1]])
-        total_audio_input = np.concatenate([s.audio_embd for s in streamer.segment_queue], axis=0)
-        
-        full_out_text, _ = streamer.run_llm_buffered(total_audio_input, prefix_str, is_last_chunk=was_last)
-        new_seg.committed_text = full_out_text[len(prefix_str):]
-
-    t_total = time.time() - t_main_start
-    streamer.shutdown()
-    
-    audio_duration = total_len / 16000
-    rtf = t_total / audio_duration if audio_duration > 0 else 0
-    
-    print("\n\n--- Done ---")
-    print(f"\n📊 性能统计 (Streaming Mode):")
-    print(f"  🔹 初始化耗时: {streamer.load_time:.3f} s")
-    print(f"  🔹 音频总时长: {audio_duration:.2f} s")
-    print(f"  🔹 处理总耗时: {t_total:.3f} s (RTF: {rtf:.4f})")
-    # print(f"  🔹 - 编码器总计耗时: {streamer.total_encode_time:.3f} s (Pipelined Overlapped)")
-    print(f"  🔹 - 进入处理等待: {streamer.total_wait_time:.3f} s (主要为首段加载耗时)")
-    print(f"  🔹 - LLM Prefill  : {streamer.total_prefill_time:.3f} s | {streamer.total_prefill_tokens} tokens | {streamer.total_prefill_tokens/streamer.total_prefill_time if streamer.total_prefill_time > 0 else 0:.1f} tokens/s")
-    print(f"  🔹 - LLM Decode   : {streamer.total_decode_time:.3f} s | {streamer.total_decode_tokens} tokens | {streamer.total_decode_tokens/streamer.total_decode_time if streamer.total_decode_time > 0 else 0:.1f} tokens/s")
-    # print(f"\n💡 注：由于采用了流水线并行，'编码器耗时' 与 'LLM耗时' 深度重叠，\n  实际感知卡顿和等待仅体现在 '进入处理等待'。")
-
 if __name__ == "__main__":
     # Windows 环境多进程启动优化
     import warnings
     warnings.filterwarnings("ignore")
-    main()
+    
+    # 定义路径
+    PROJECT_ROOT = Path(__file__).parent.absolute()
+    frontend = os.path.join(PROJECT_ROOT, "model", "onnx", "qwen3_asr_encoder_frontend.fp16.onnx")
+    backend = os.path.join(PROJECT_ROOT, "model", "onnx", "qwen3_asr_encoder_backend.fp16.onnx")
+    gguf = os.path.join(PROJECT_ROOT, "model", "qwen3_asr_llm.q8_0.gguf")
+    mel_filters = os.path.join(PROJECT_ROOT, "model", "mel_filters.npy")
+
+    # 1. 初始化引擎 (包含加载模型，比较耗时)
+    print("正在初始化引擎...")
+    engine = QwenASREngine(
+        encoder_frontend_path=frontend,
+        encoder_backend_path=backend,
+        llm_gguf_path=gguf,
+        mel_filters_path=mel_filters,
+        verbose=True
+    )
+
+    # 2. 执行转录 (可调用多次)
+    audio_path = "睡前消息.m4a"
+    
+    # 示例：仅转录前 60 秒，分块 40 秒
+    result_text = engine.transcribe(
+        audio_file=audio_path,
+        context="这是1004期睡前消息，主持人叫督工，助理叫静静，",
+        language="Chinese", # 强制指定语言 (如 'Chinese', 'English', None)
+        start_second=0.0,   # 从何处开始读音频
+        duration=120,       # 读取多长音频，None 表示全部读取
+        temperature=0.4,    # LLM Decode 温度
+        chunk_size=40.0,    # 每一片段的时长
+        memory_num=2,       # 记忆多少片段
+        rollback_num=5      # 连接处回滚几个 TOKEN
+    )
+    
+    
+    # 3. 资源清理
+    engine.shutdown()
