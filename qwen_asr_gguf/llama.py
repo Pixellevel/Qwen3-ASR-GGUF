@@ -358,7 +358,7 @@ def load_model(model_path: str):
         model: llama_model 指针
     """
     lib_dir = Path(__file__).parent / 'bin'
-    model_path = Path(model_path).resolve()
+    model_path = Path(model_path)
     model_rel = Path(relpath(model_path, lib_dir))
 
     # 跳转到 dll 所在目录，并将其加到 Path
